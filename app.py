@@ -22,8 +22,14 @@ from raman_webapp.data import (
     load_processed_csvs,
     load_raw_excel,
     preprocess_raw_dataset,
+    split_train_holdout,
 )
-from raman_webapp.modeling import generate_model_interpretation, predict_patient, run_modeling
+from raman_webapp.modeling import (
+    evaluate_holdout,
+    generate_model_interpretation,
+    predict_patient,
+    run_modeling,
+)
 from raman_webapp.preprocessing import batch_snr_raman
 from raman_webapp.visuals import (
     boxplot_snr_figure,
@@ -58,6 +64,11 @@ def get_processed_dataset(data_source: str) -> ProcessedDataset:
 
 
 @st.cache_data(show_spinner=False)
+def get_train_holdout_datasets(data_source: str) -> tuple[ProcessedDataset, ProcessedDataset]:
+    return split_train_holdout(get_processed_dataset(data_source))
+
+
+@st.cache_data(show_spinner=False)
 def get_analysis_summary(dataset: ProcessedDataset) -> dict[str, np.ndarray]:
     return mean_std_by_class(dataset)
 
@@ -85,6 +96,11 @@ def get_umap(dataset: ProcessedDataset):
 @st.cache_data(show_spinner=False)
 def get_modeling_report(dataset: ProcessedDataset):
     return run_modeling(dataset)
+
+
+@st.cache_data(show_spinner=False)
+def get_holdout_report(train_dataset: ProcessedDataset, holdout_dataset: ProcessedDataset):
+    return evaluate_holdout(get_modeling_report(train_dataset), holdout_dataset)
 
 
 @st.cache_data(show_spinner=False)
@@ -175,12 +191,17 @@ with st.sidebar:
     st.header("Configuration")
     data_source = st.radio("Dataset source", ["Use precomputed CSV", "Recompute from Excel"], index=0)
     st.write("`Use precomputed CSV` starts fast. `Recompute from Excel` reruns baseline correction and SNV.")
+    if data_source == "Use precomputed CSV":
+        st.warning(
+            "The bundled CSV dataset contains 93 spectra (50 healthy, 43 disease), not the full 100 from Excel. "
+            "Use `Recompute from Excel` if you want the full 90 train / 10 holdout split."
+        )
 
-dataset = get_processed_dataset(data_source)
+dataset, holdout_dataset = get_train_holdout_datasets(data_source)
 informative_region = get_informative_region(dataset)
 analysis_summary = get_analysis_summary(dataset)
 snr_basis_dataset = get_snr_basis_dataset()
-snr_reference_dataset = snr_basis_dataset if snr_basis_dataset.y.shape[0] == dataset.y.shape[0] else dataset
+snr_reference_dataset, _ = split_train_holdout(snr_basis_dataset)
 
 wn_min = float(snr_reference_dataset.wavenumber.min())
 wn_max = float(snr_reference_dataset.wavenumber.max())
@@ -248,6 +269,10 @@ with tab_overview:
     col1.metric("Spectra", dataset.X.shape[0])
     col2.metric("Features", dataset.X.shape[1])
     col3.metric("Healthy / Disease", f"{int((dataset.y == 0).sum())} / {int((dataset.y == 1).sum())}")
+    st.info(
+        "Training views in this app now use 90 patients. "
+        "The 10 exported holdout patients (5 healthy, 5 disease) are excluded from training and reserved for honest checking."
+    )
 
     healthy = dataset.X[dataset.y == 0]
     disease = dataset.X[dataset.y == 1]
@@ -299,11 +324,6 @@ with tab_snr:
         "SNR is recomputed from the windows selected in the sidebar. "
         "The calculation uses baseline-corrected spectra before SNV whenever available."
     )
-    if snr_reference_dataset is not snr_basis_dataset:
-        st.warning(
-            "The current dataset size does not match the Excel source exactly, so custom SNR is being recomputed "
-            "from the currently loaded dataset rather than from the full baseline-corrected Excel batch."
-        )
     st.caption(
         f"Current settings: signal window = {signal_window[0]:.1f}-{signal_window[1]:.1f} cm^-1, "
         f"noise window = {noise_window[0]:.1f}-{noise_window[1]:.1f} cm^-1, k = {snr_k:.1f}"
@@ -391,6 +411,14 @@ with tab_models:
     )
     st.success(f"Most frequently selected pipeline: {modeling_report.final_selected_model_name}")
 
+    st.subheader("Holdout evaluation on 10 excluded patients")
+    st.caption("These metrics are computed on the exported patients from `patient_csv_exports`, excluded from all training.")
+    holdout_model_dataset = holdout_dataset.select_wavenumber_range(modeling_low, modeling_high)
+    holdout_report = get_holdout_report(model_dataset, holdout_model_dataset)
+    holdout_left, holdout_right = st.columns([1, 2])
+    holdout_left.dataframe(holdout_report.summary_df, use_container_width=True)
+    holdout_right.dataframe(holdout_report.predictions_df, use_container_width=True)
+
 with tab_interpret:
     modeling_report = get_modeling_report(model_dataset)
     st.markdown(interpretation_block(model_dataset, snr_summary, modeling_report))
@@ -416,6 +444,10 @@ with tab_patient_prediction:
         "Upload a patient spectrum as CSV. Supported formats: "
         "two numeric columns (`wavenumber`, `intensity`), one intensity column with the same length as the reference axis, "
         "or one row of intensities with the same length as the reference axis."
+    )
+    st.caption(
+        "The deployment model in this tab is trained only on the 90-patient training set. "
+        "The 10 CSV files in `patient_csv_exports` are now honest holdout examples."
     )
     uploaded_file = st.file_uploader("Patient spectrum CSV", type=["csv"], key="patient_csv")
 

@@ -15,6 +15,8 @@ class RawDataset:
     wavenumber: np.ndarray
     x_health: np.ndarray
     x_disease: np.ndarray
+    health_names: np.ndarray
+    disease_names: np.ndarray
 
 
 @dataclass
@@ -24,6 +26,7 @@ class ProcessedDataset:
     wavenumber: np.ndarray
     snr: np.ndarray
     X_snr: np.ndarray | None = None
+    sample_names: np.ndarray | None = None
 
     @property
     def labels(self) -> np.ndarray:
@@ -37,6 +40,18 @@ class ProcessedDataset:
             wavenumber=self.wavenumber[mask].copy(),
             snr=self.snr.copy(),
             X_snr=self.X_snr[:, mask].copy() if self.X_snr is not None else None,
+            sample_names=self.sample_names.copy() if self.sample_names is not None else None,
+        )
+
+    def subset_by_mask(self, mask: np.ndarray) -> "ProcessedDataset":
+        mask = np.asarray(mask, dtype=bool)
+        return ProcessedDataset(
+            X=self.X[mask].copy(),
+            y=self.y[mask].copy(),
+            wavenumber=self.wavenumber.copy(),
+            snr=self.snr[mask].copy(),
+            X_snr=self.X_snr[mask].copy() if self.X_snr is not None else None,
+            sample_names=self.sample_names[mask].copy() if self.sample_names is not None else None,
         )
 
 
@@ -50,6 +65,20 @@ class ExternalSpectrum:
     parser_mode: str
 
 
+HOLDOUT_SAMPLE_NAMES = {
+    "healthy1",
+    "healthy2",
+    "healthy3",
+    "healthy4",
+    "healthy5",
+    "heart_patient1",
+    "heart_patient2",
+    "heart_patient3",
+    "heart_patient4",
+    "heart_patient5",
+}
+
+
 def load_raw_excel(path: str | Path) -> RawDataset:
     path = Path(path)
     df_health = pd.read_excel(path, sheet_name="health")
@@ -58,11 +87,15 @@ def load_raw_excel(path: str | Path) -> RawDataset:
     wavenumber = df_health["wavenumber"].to_numpy(dtype=float)
     x_health = df_health.drop(columns=["wavenumber"]).T.to_numpy(dtype=float)
     x_disease = df_disease.drop(columns=["wavenumber"]).T.to_numpy(dtype=float)
+    health_names = df_health.drop(columns=["wavenumber"]).columns.to_numpy(dtype=str)
+    disease_names = df_disease.drop(columns=["wavenumber"]).columns.to_numpy(dtype=str)
 
     return RawDataset(
         wavenumber=wavenumber,
         x_health=x_health,
         x_disease=x_disease,
+        health_names=health_names,
+        disease_names=disease_names,
     )
 
 
@@ -79,6 +112,7 @@ def preprocess_raw_dataset(
             np.ones(raw.x_disease.shape[0], dtype=int),
         ]
     )
+    sample_names = np.concatenate([raw.health_names, raw.disease_names])
 
     X_bc = np.empty_like(X, dtype=float)
     for idx in range(X.shape[0]):
@@ -93,6 +127,7 @@ def preprocess_raw_dataset(
         wavenumber=raw.wavenumber.copy(),
         snr=snr,
         X_snr=X_bc,
+        sample_names=sample_names.copy(),
     )
 
 
@@ -106,7 +141,8 @@ def load_processed_csvs(
     y = _read_numeric_csv_vector(y_path, dtype=int)
     wavenumber = _read_numeric_csv_vector(wavenumber_path, dtype=float)
     snr = _read_numeric_csv_vector(snr_path, dtype=float)
-    return ProcessedDataset(X=X, y=y, wavenumber=wavenumber, snr=snr, X_snr=None)
+    sample_names = _default_sample_names_from_labels(y)
+    return ProcessedDataset(X=X, y=y, wavenumber=wavenumber, snr=snr, X_snr=None, sample_names=sample_names)
 
 
 def _read_numeric_csv_matrix(path: str | Path) -> np.ndarray:
@@ -122,6 +158,34 @@ def _read_numeric_csv_vector(path: str | Path, dtype: type[int] | type[float]) -
         df = df.iloc[:, :1]
     series = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
     return series.to_numpy(dtype=dtype)
+
+
+def _default_sample_names_from_labels(y: np.ndarray) -> np.ndarray:
+    names: list[str] = []
+    healthy_idx = 0
+    disease_idx = 0
+    for label in y:
+        if int(label) == 0:
+            healthy_idx += 1
+            names.append(f"healthy{healthy_idx}")
+        else:
+            disease_idx += 1
+            names.append(f"heart_patient{disease_idx}")
+    return np.array(names, dtype=str)
+
+
+def split_train_holdout(dataset: ProcessedDataset) -> tuple[ProcessedDataset, ProcessedDataset]:
+    if dataset.sample_names is None:
+        raise ValueError("Dataset sample names are required for holdout splitting.")
+
+    holdout_mask = np.isin(dataset.sample_names, list(HOLDOUT_SAMPLE_NAMES))
+    if holdout_mask.sum() != len(HOLDOUT_SAMPLE_NAMES):
+        missing = sorted(HOLDOUT_SAMPLE_NAMES.difference(set(dataset.sample_names.tolist())))
+        raise ValueError(f"Could not locate all holdout samples in dataset: {missing}")
+
+    train_dataset = dataset.subset_by_mask(~holdout_mask)
+    holdout_dataset = dataset.subset_by_mask(holdout_mask)
+    return train_dataset, holdout_dataset
 
 
 def load_external_spectrum_csv(file_obj, reference_wavenumber: np.ndarray) -> ExternalSpectrum:

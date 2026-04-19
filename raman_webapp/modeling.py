@@ -42,6 +42,12 @@ class ModelingReport:
     top_bands_df: pd.DataFrame
 
 
+@dataclass
+class HoldoutReport:
+    summary_df: pd.DataFrame
+    predictions_df: pd.DataFrame
+
+
 def build_pipelines() -> dict[str, Pipeline]:
     models = {
         "LogReg": LogisticRegression(max_iter=5000, random_state=42),
@@ -206,6 +212,39 @@ def predict_patient(report: ModelingReport, X: np.ndarray) -> dict[str, float | 
         "probability_disease": prob_disease,
         "probability_healthy": 1.0 - prob_disease,
     }
+
+
+def evaluate_holdout(report: ModelingReport, dataset: ProcessedDataset) -> HoldoutReport:
+    y_score = _get_score_values(report.deployment_model, dataset.X)
+    y_pred = report.deployment_model.predict(dataset.X).astype(int)
+
+    metrics_rows: list[dict[str, float | str]] = [
+        {"metric": "accuracy", "value": accuracy_score(dataset.y, y_pred)},
+        {"metric": "balanced_accuracy", "value": balanced_accuracy_score(dataset.y, y_pred)},
+        {"metric": "f1", "value": f1_score(dataset.y, y_pred)},
+    ]
+    if len(np.unique(dataset.y)) == 2:
+        metrics_rows.append({"metric": "roc_auc", "value": roc_auc_score(dataset.y, y_score)})
+
+    sample_names = (
+        dataset.sample_names
+        if dataset.sample_names is not None
+        else np.array([f"sample_{idx + 1}" for idx in range(dataset.X.shape[0])], dtype=str)
+    )
+    predictions_df = pd.DataFrame(
+        {
+            "sample_name": sample_names,
+            "true_label": np.where(dataset.y == 0, "Healthy", "Disease"),
+            "predicted_label": np.where(y_pred == 0, "Healthy", "Disease"),
+            "probability_disease": y_score,
+            "correct": y_pred == dataset.y,
+        }
+    )
+
+    return HoldoutReport(
+        summary_df=pd.DataFrame(metrics_rows),
+        predictions_df=predictions_df,
+    )
 
 
 def _smooth_coefficients(coef: np.ndarray) -> np.ndarray:
