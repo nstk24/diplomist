@@ -37,10 +37,8 @@ streamlit run app.py
 
 ## Источники данных
 
-В sidebar можно выбрать один из двух режимов:
-
-- `Use precomputed CSV` — быстрый старт на `X_clean.csv`, `y_clean.csv`, `wavenumber.csv`, `snr_clean.csv`.
-- `Recompute from Excel` — пересчёт preprocessing напрямую из `Raman_krov_SSZ-zdorovye.xlsx`.
+Приложение загружает и пересчитывает preprocessing только из `Raman_krov_SSZ-zdorovye.xlsx`.
+Использование предвычисленных CSV для обучения отключено.
 
 ## Замечание
 

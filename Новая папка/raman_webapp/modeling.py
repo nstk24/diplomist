@@ -9,7 +9,7 @@ from sklearn.base import clone
 from sklearn.decomposition import PCA
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, roc_curve
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
@@ -32,8 +32,6 @@ class ModelingReport:
     screening_df: pd.DataFrame
     nested_fold_df: pd.DataFrame
     nested_summary_df: pd.DataFrame
-    best_model_metrics_df: pd.DataFrame
-    best_model_roc_df: pd.DataFrame
     selected_model_counts: pd.Series
     final_selected_model_name: str
     deployment_model: Pipeline
@@ -48,7 +46,6 @@ class ModelingReport:
 class HoldoutReport:
     summary_df: pd.DataFrame
     predictions_df: pd.DataFrame
-    roc_df: pd.DataFrame | None = None
 
 
 def build_pipelines() -> dict[str, Pipeline]:
@@ -148,36 +145,6 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
         ]
     )
 
-    best_screening_row = screening_df.iloc[0]
-    best_screening_model_name = str(best_screening_row["model"])
-    best_model_metrics_df = pd.DataFrame(
-        [
-            {"metric": "roc_auc", "value": float(best_screening_row["roc_auc_mean"]), "std": float(best_screening_row["roc_auc_std"])},
-            {"metric": "accuracy", "value": float(best_screening_row["accuracy_mean"]), "std": np.nan},
-            {"metric": "f1", "value": float(best_screening_row["f1_mean"]), "std": np.nan},
-            {
-                "metric": "balanced_accuracy",
-                "value": float(best_screening_row["balanced_accuracy_mean"]),
-                "std": np.nan,
-            },
-        ]
-    )
-
-    best_screening_pipe = build_pipelines()[best_screening_model_name]
-    oof_scores = np.zeros(dataset.y.shape[0], dtype=float)
-    for train_idx, test_idx in outer_cv.split(dataset.X, dataset.y):
-        fold_pipe = clone(best_screening_pipe)
-        fold_pipe.fit(dataset.X[train_idx], dataset.y[train_idx])
-        oof_scores[test_idx] = _get_score_values(fold_pipe, dataset.X[test_idx])
-    fpr, tpr, thresholds = roc_curve(dataset.y, oof_scores)
-    best_model_roc_df = pd.DataFrame(
-        {
-            "fpr": fpr,
-            "tpr": tpr,
-            "threshold": thresholds,
-        }
-    )
-
     deployment_model = clone(build_pipelines()[final_selected_model_name])
     deployment_model.fit(dataset.X, dataset.y)
 
@@ -204,8 +171,6 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
         screening_df=screening_df,
         nested_fold_df=nested_fold_df,
         nested_summary_df=nested_summary_df,
-        best_model_metrics_df=best_model_metrics_df,
-        best_model_roc_df=best_model_roc_df,
         selected_model_counts=selected_model_counts,
         final_selected_model_name=final_selected_model_name,
         deployment_model=deployment_model,
@@ -276,21 +241,9 @@ def evaluate_holdout(report: ModelingReport, dataset: ProcessedDataset) -> Holdo
         }
     )
 
-    roc_df = None
-    if len(np.unique(dataset.y)) == 2:
-        fpr, tpr, thresholds = roc_curve(dataset.y, y_score)
-        roc_df = pd.DataFrame(
-            {
-                "fpr": fpr,
-                "tpr": tpr,
-                "threshold": thresholds,
-            }
-        )
-
     return HoldoutReport(
         summary_df=pd.DataFrame(metrics_rows),
         predictions_df=predictions_df,
-        roc_df=roc_df,
     )
 
 

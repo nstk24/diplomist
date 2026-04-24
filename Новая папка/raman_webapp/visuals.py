@@ -150,36 +150,6 @@ def model_comparison_figure(screening_df: pd.DataFrame, nested_summary_df: pd.Da
     return fig
 
 
-def roc_curve_figure(roc_df: pd.DataFrame, title: str, auc_value: float | None = None) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=roc_df["fpr"],
-            y=roc_df["tpr"],
-            mode="lines+markers",
-            name="ROC",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=[0.0, 1.0],
-            y=[0.0, 1.0],
-            mode="lines",
-            name="Random",
-            line=dict(dash="dash", color="gray"),
-        )
-    )
-    final_title = title if auc_value is None else f"{title} (AUC={auc_value:.3f})"
-    fig.update_layout(
-        title=final_title,
-        xaxis_title="False Positive Rate",
-        yaxis_title="True Positive Rate",
-        xaxis=dict(range=[0, 1]),
-        yaxis=dict(range=[0, 1]),
-    )
-    return fig
-
-
 def coefficient_figure(wavenumber: np.ndarray, coef: np.ndarray, title: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=wavenumber, y=coef, mode="lines", name="Coefficient"))

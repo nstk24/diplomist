@@ -40,7 +40,6 @@ from raman_webapp.visuals import (
     histogram_snr_figure,
     model_comparison_figure,
     peak_detection_figure,
-    roc_curve_figure,
     scatter_projection_figure,
     spectrum_line_figure,
     spectrum_with_band_figure,
@@ -481,24 +480,12 @@ with tab_models:
     st.subheader("Exploratory screening")
     st.dataframe(modeling_report.screening_df, use_container_width=True)
 
-    st.subheader("Метрики лучшей модели")
+    st.subheader("Nested CV estimate of the full selection procedure")
     left, right = st.columns([1, 2])
-    best_model_metrics_display = modeling_report.best_model_metrics_df.copy()
-    best_model_metrics_display = best_model_metrics_display.rename(
-        columns={
-            "metric": "Метрика",
-            "value": "Значение",
-            "std": "Std (если доступно)",
-        }
-    )
-    left.dataframe(best_model_metrics_display, use_container_width=True)
+    left.dataframe(modeling_report.nested_summary_df, use_container_width=True)
     right.plotly_chart(
         model_comparison_figure(modeling_report.screening_df, modeling_report.nested_summary_df),
         use_container_width=True,
-    )
-    st.caption(
-        f"Слева показаны метрики лучшего кандидата по screening: `{modeling_report.screening_df.iloc[0]['model']}`. "
-        "График справа по-прежнему показывает сравнение всех кандидатов и оценку nested CV."
     )
 
     st.subheader("Selected pipeline frequency across outer folds")
@@ -513,26 +500,9 @@ with tab_models:
         st.caption("These metrics are computed on the exported patients from `patient_csv_exports`, excluded from all training.")
         holdout_model_dataset = holdout_dataset.select_wavenumber_range(modeling_low, modeling_high)
         holdout_report = get_holdout_report(model_dataset, holdout_model_dataset)
-        holdout_left, holdout_mid, holdout_right = st.columns([1, 1, 2])
+        holdout_left, holdout_right = st.columns([1, 2])
         holdout_left.dataframe(holdout_report.summary_df, use_container_width=True)
-        if holdout_report.roc_df is not None:
-            holdout_auc_row = holdout_report.summary_df.loc[holdout_report.summary_df["metric"] == "roc_auc", "value"]
-            holdout_auc = float(holdout_auc_row.iloc[0]) if not holdout_auc_row.empty else None
-            holdout_mid.plotly_chart(
-                roc_curve_figure(
-                    holdout_report.roc_df,
-                    "ROC-кривая лучшей модели на holdout",
-                    auc_value=holdout_auc,
-                ),
-                use_container_width=True,
-            )
-        else:
-            holdout_mid.info("ROC-кривая недоступна: в holdout должен присутствовать оба класса.")
         holdout_right.dataframe(holdout_report.predictions_df, use_container_width=True)
-        st.warning(
-            "Если метрики на holdout выглядят идеальными, это не обязательно означает реальную надежность модели. "
-            "Сейчас holdout очень маленький: всего 10 пациентов, поэтому оценки могут быть нестабильными и слишком оптимистичными."
-        )
     else:
         st.info("Holdout evaluation is unavailable for the current dataset because the predefined 10 patient IDs were not found.")
 
