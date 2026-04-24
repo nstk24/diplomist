@@ -8,6 +8,8 @@ import pandas as pd
 import streamlit as st
 
 from raman_webapp.analysis import (
+    annotate_peak_importance,
+    compute_spectral_importance,
     detect_spectral_peaks,
     match_peaks_to_reference_bands,
     detect_informative_region,
@@ -33,6 +35,7 @@ from raman_webapp.modeling import (
     predict_patient,
     run_modeling,
 )
+from raman_webapp.gemini_analysis import generate_gemini_hypotheses, is_gemini_configured
 from raman_webapp.preprocessing import batch_snr_raman
 from raman_webapp.visuals import (
     boxplot_snr_figure,
@@ -164,6 +167,11 @@ def get_reference_band_library() -> pd.DataFrame:
     return load_reference_band_library()
 
 
+@st.cache_data(show_spinner=False)
+def get_spectral_importance(dataset: ProcessedDataset):
+    return compute_spectral_importance(dataset)
+
+
 def _priority_to_russian(priority: str) -> str:
     return {
         "high": "высокий",
@@ -266,6 +274,7 @@ with st.sidebar:
 informative_region = get_informative_region(dataset)
 analysis_summary = get_analysis_summary(dataset)
 reference_band_library = get_reference_band_library()
+spectral_importance = get_spectral_importance(dataset)
 try:
     snr_reference_dataset, _ = split_train_holdout(snr_basis_dataset)
 except ValueError:
@@ -689,6 +698,7 @@ with tab_patient_prediction:
                 matching_mode="close" if peak_matching_mode_label == "Близкое совпадение" else "exact",
                 tolerance_cm=float(peak_tolerance_cm),
             )
+            annotated_peak_df = annotate_peak_importance(peak_plot_result.peaks_df, spectral_importance)
             peak_labels_by_wavenumber: dict[float, str] = {}
             for _, row in peak_match_result.matched_peaks_df.iterrows():
                 peak_wn = float(row["wavenumber_cm-1"])
@@ -716,16 +726,26 @@ with tab_patient_prediction:
             if peak_plot_result.peaks_df.empty:
                 st.info("С текущими порогами пики не найдены. Попробуй уменьшить минимальную prominence.")
             else:
-                peak_display_df = peak_plot_result.peaks_df.rename(
+                peak_display_df = annotated_peak_df.copy()
+                peak_display_df["class_importance_priority"] = peak_display_df["class_importance_priority"].map(
+                    _priority_to_russian
+                )
+                peak_display_df = peak_display_df.rename(
                     columns={
                         "rank_by_prominence": "Ранг",
                         "wavenumber_cm-1": "Волновое число, см⁻¹",
                         "intensity": "Интенсивность",
                         "prominence": "Prominence",
                         "width_cm-1": "Ширина, см⁻¹",
+                        "class_importance_score": "Значимость по различию классов",
+                        "class_importance_priority": "Приоритет по различию классов",
                     }
                 )
                 st.dataframe(peak_display_df, use_container_width=True)
+                st.caption(
+                    "Значимость по различию классов рассчитывается по разности средних спектров Healthy и Disease, "
+                    "нормированной на разброс. Это локальная оценка того, насколько область помогает разделять классы в обучающем датасете."
+                )
 
                 st.subheader("Интерпретация найденных пиков")
                 if peak_match_result.matched_peaks_df.empty:
@@ -750,12 +770,29 @@ with tab_patient_prediction:
                     matched_display_df = peak_match_result.matched_peaks_df.copy()
                     matched_display_df["priority"] = matched_display_df["priority"].map(_priority_to_russian)
                     matched_display_df["match_type"] = matched_display_df["match_type"].map(_match_type_to_russian)
+                    matched_display_df = matched_display_df.merge(
+                        annotated_peak_df[
+                            [
+                                "rank_by_prominence",
+                                "wavenumber_cm-1",
+                                "class_importance_score",
+                                "class_importance_priority",
+                            ]
+                        ],
+                        on=["rank_by_prominence", "wavenumber_cm-1"],
+                        how="left",
+                    )
+                    matched_display_df["class_importance_priority"] = matched_display_df["class_importance_priority"].map(
+                        _priority_to_russian
+                    )
                     matched_display_df = matched_display_df.rename(
                         columns={
                             "rank_by_prominence": "Ранг пика",
                             "wavenumber_cm-1": "Волновое число, см⁻¹",
                             "match_type": "Тип совпадения",
                             "priority": "Приоритет",
+                            "class_importance_priority": "Приоритет по различию классов",
+                            "class_importance_score": "Значимость по различию классов",
                             "label": "Полоса",
                             "assignment": "Предполагаемая группа",
                             "clinical_hint": "Клиническая подсказка",
@@ -771,6 +808,56 @@ with tab_patient_prediction:
             pred_cols[0].metric("Predicted class", prediction["predicted_label"])
             pred_cols[1].metric("P(Disease)", f"{prediction['probability_disease']:.3f}")
             pred_cols[2].metric("P(Healthy)", f"{prediction['probability_healthy']:.3f}")
+
+            st.subheader("Gemini: гипотезы по спектральным областям")
+            gemini_ready, gemini_status = is_gemini_configured()
+            if gemini_ready:
+                st.caption(
+                    "Gemini получает только агрегированные спектральные области пиков и краткий контекст. "
+                    "Сырые массивы спектра и наши грубые назначения веществ не отправляются."
+                )
+            else:
+                st.info(
+                    "Gemini сейчас недоступен. "
+                    f"{gemini_status} Запусти приложение из того же терминала, где задан GEMINI_API_KEY."
+                )
+
+            gemini_button = st.button(
+                "Сгенерировать гипотезы через Gemini",
+                key="gemini_generate_hypotheses",
+                disabled=not gemini_ready or peak_plot_result.peaks_df.empty,
+            )
+            gemini_state_key = "gemini_hypotheses_response"
+            if gemini_button:
+                with st.spinner("Gemini анализирует спектральные области..."):
+                    gemini_result = generate_gemini_hypotheses(
+                        peaks_df=annotated_peak_df,
+                        prediction_probability_disease=float(prediction["probability_disease"]),
+                        peak_basis_label=peak_basis_mode,
+                        spectrum_quality_text=str(quality["reason"]),
+                        model_name=str(modeling_report.final_selected_model_name),
+                    )
+                st.session_state[gemini_state_key] = {
+                    "ok": gemini_result.ok,
+                    "text": gemini_result.text,
+                    "prompt_payload": gemini_result.prompt_payload,
+                    "model_used": gemini_result.model_used,
+                }
+
+            gemini_state = st.session_state.get(gemini_state_key)
+            if gemini_state:
+                if gemini_state["ok"]:
+                    st.warning(
+                        "Ниже приведена модельная интерпретация для поддержки врача. "
+                        "Это не диагноз и не подтверждение конкретного вещества."
+                    )
+                    if gemini_state.get("model_used"):
+                        st.caption(f"Ответ получен от модели: `{gemini_state['model_used']}`")
+                    st.markdown(gemini_state["text"])
+                    with st.expander("Какие данные были отправлены в Gemini", expanded=False):
+                        st.json(gemini_state["prompt_payload"])
+                else:
+                    st.error(str(gemini_state["text"]))
 
             mean_healthy = model_dataset.X[model_dataset.y == 0].mean(axis=0)
             mean_disease = model_dataset.X[model_dataset.y == 1].mean(axis=0)

@@ -41,6 +41,15 @@ class PeakBandMatchResult:
     summary_df: pd.DataFrame
 
 
+@dataclass
+class SpectralImportanceResult:
+    wavenumber: np.ndarray
+    importance_score: np.ndarray
+    normalized_score: np.ndarray
+    high_threshold: float
+    medium_threshold: float
+
+
 def mean_std_by_class(dataset: ProcessedDataset) -> dict[str, np.ndarray]:
     healthy = dataset.X[dataset.y == 0]
     disease = dataset.X[dataset.y == 1]
@@ -262,6 +271,74 @@ def detect_spectral_peaks(
             ["rank_by_prominence", "wavenumber_cm-1", "intensity", "prominence", "width_cm-1"]
         ],
     )
+
+
+def compute_spectral_importance(
+    dataset: ProcessedDataset,
+    smoothing_window: int = 31,
+) -> SpectralImportanceResult:
+    healthy = dataset.X[dataset.y == 0]
+    disease = dataset.X[dataset.y == 1]
+
+    healthy_mean = healthy.mean(axis=0)
+    disease_mean = disease.mean(axis=0)
+    healthy_std = healthy.std(axis=0, ddof=1)
+    disease_std = disease.std(axis=0, ddof=1)
+
+    pooled_std = np.sqrt((healthy_std**2 + disease_std**2) / 2.0)
+    raw_score = np.abs(disease_mean - healthy_mean) / (pooled_std + 1e-12)
+    if smoothing_window > 1:
+        raw_score = uniform_filter1d(raw_score, size=smoothing_window, mode="reflect")
+
+    max_score = float(np.max(raw_score)) if raw_score.size else 0.0
+    normalized_score = raw_score / (max_score + 1e-12)
+    high_threshold = float(np.quantile(normalized_score, 0.85))
+    medium_threshold = float(np.quantile(normalized_score, 0.60))
+
+    return SpectralImportanceResult(
+        wavenumber=dataset.wavenumber.copy(),
+        importance_score=raw_score,
+        normalized_score=normalized_score,
+        high_threshold=high_threshold,
+        medium_threshold=medium_threshold,
+    )
+
+
+def annotate_peak_importance(
+    peaks_df: pd.DataFrame,
+    importance_result: SpectralImportanceResult,
+) -> pd.DataFrame:
+    if peaks_df.empty:
+        return peaks_df.copy()
+
+    annotated_rows: list[dict[str, float | int | str]] = []
+    wn = importance_result.wavenumber
+    norm_score = importance_result.normalized_score
+
+    for row in peaks_df.to_dict(orient="records"):
+        center = float(row["wavenumber_cm-1"])
+        width = float(row["width_cm-1"])
+        half_width = max(width / 2.0, 3.0)
+        mask = (wn >= center - half_width) & (wn <= center + half_width)
+        if not np.any(mask):
+            nearest_idx = int(np.argmin(np.abs(wn - center)))
+            local_score = float(norm_score[nearest_idx])
+        else:
+            local_score = float(np.max(norm_score[mask]))
+
+        if local_score >= importance_result.high_threshold:
+            local_priority = "high"
+        elif local_score >= importance_result.medium_threshold:
+            local_priority = "medium"
+        else:
+            local_priority = "support"
+
+        updated_row = dict(row)
+        updated_row["class_importance_score"] = local_score
+        updated_row["class_importance_priority"] = local_priority
+        annotated_rows.append(updated_row)
+
+    return pd.DataFrame(annotated_rows)
 
 
 def match_peaks_to_reference_bands(
