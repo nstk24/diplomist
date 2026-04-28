@@ -14,6 +14,16 @@ from sklearn.preprocessing import StandardScaler
 from .data import ProcessedDataset
 
 
+CLINICALLY_PRIORITIZED_REGIONS: tuple[tuple[float, float], ...] = (
+    (1000.0, 1005.0),
+    (1153.0, 1155.0),
+    (1246.0, 1266.0),
+    (1445.0, 1448.0),
+    (1514.0, 1516.0),
+    (1655.0, 1670.0),
+)
+
+
 @dataclass
 class Projection2D:
     embedding: np.ndarray
@@ -184,7 +194,10 @@ def detect_informative_region(
         best_end = min(n_features - 1, best_start + min_points - 1)
         best_start = max(0, best_end - min_points + 1)
 
-    if best_start is None or best_end is None:
+    preferred_start, preferred_end = _preferred_region_bounds(dataset.wavenumber)
+    if preferred_start is not None and preferred_end is not None:
+        best_start, best_end = preferred_start, preferred_end
+    elif best_start is None or best_end is None:
         mask = np.ones(n_features, dtype=bool)
         best_start, best_end = 0, n_features - 1
     else:
@@ -199,6 +212,140 @@ def detect_informative_region(
         quality=quality,
         threshold=threshold,
     )
+
+
+def detect_signal_quality_region(
+    dataset: ProcessedDataset,
+    smoothing_window: int = 21,
+    relative_threshold: float = 0.08,
+    snr_threshold: float = 1.5,
+    min_presence_fraction: float = 0.2,
+    min_fraction: float = 0.3,
+    preferred_bounds: tuple[float, float] = (400.0, 1800.0),
+) -> InformativeRegion:
+    X_source = dataset.X_snr if dataset.X_snr is not None else dataset.X
+    X_source = np.asarray(X_source, dtype=float)
+    n_samples, n_features = X_source.shape
+
+    if n_features < 5:
+        mask = np.ones(n_features, dtype=bool)
+        return InformativeRegion(
+            low=float(dataset.wavenumber[0]),
+            high=float(dataset.wavenumber[-1]),
+            mask=mask,
+            quality=np.ones(n_features, dtype=float),
+            threshold=1.0,
+        )
+
+    window = max(5, smoothing_window)
+    if window % 2 == 0:
+        window += 1
+
+    smoothed = uniform_filter1d(X_source, size=window, axis=1, mode="reflect")
+    residual = X_source - smoothed
+
+    signal_envelope = np.median(np.abs(smoothed), axis=0)
+    noise_floor = 1.4826 * np.median(np.abs(residual), axis=0)
+    noise_floor = uniform_filter1d(noise_floor, size=max(5, window // 2), mode="reflect")
+
+    reference_scale = float(np.quantile(signal_envelope, 0.95)) if signal_envelope.size else 0.0
+    reference_scale = max(reference_scale, 1e-12)
+    relative_signal = signal_envelope / reference_scale
+    local_snr = signal_envelope / (noise_floor + 1e-12)
+
+    per_spectrum_scale = np.quantile(np.abs(smoothed), 0.95, axis=1, keepdims=True)
+    presence_mask = np.abs(smoothed) >= (np.maximum(per_spectrum_scale, 1e-12) * relative_threshold)
+    presence_fraction = presence_mask.mean(axis=0)
+
+    combined_quality = relative_signal * np.log1p(local_snr) * np.sqrt(np.clip(presence_fraction, 0.0, 1.0))
+    candidate_mask = _candidate_wavenumber_mask(dataset.wavenumber, preferred_bounds)
+    strict_mask = (
+        (relative_signal >= relative_threshold)
+        & (local_snr >= snr_threshold)
+        & (presence_fraction >= min_presence_fraction)
+        & candidate_mask
+    )
+
+    wide_mask = (
+        (relative_signal >= max(relative_threshold * 0.55, 0.03))
+        & (local_snr >= max(snr_threshold * 0.7, 1.1))
+        & (presence_fraction >= max(min_presence_fraction * 0.75, 0.15))
+        & candidate_mask
+    )
+
+    structure_close = np.ones(max(5, window // 2), dtype=bool)
+    structure_open = np.ones(max(5, window // 3), dtype=bool)
+    strict_mask = binary_closing(strict_mask, structure=structure_close)
+    strict_mask = binary_opening(strict_mask, structure=structure_open)
+    wide_mask = binary_closing(wide_mask, structure=structure_close)
+    wide_mask = binary_opening(wide_mask, structure=structure_open)
+
+    min_points = max(10, int(min_fraction * n_features))
+    wide_idx = np.flatnonzero(wide_mask)
+    if wide_idx.size >= min_points:
+        best_start = int(wide_idx[0])
+        best_end = int(wide_idx[-1])
+    else:
+        strict_idx = np.flatnonzero(strict_mask)
+        if strict_idx.size >= min_points:
+            best_start = int(strict_idx[0])
+            best_end = int(strict_idx[-1])
+        else:
+            fallback_idx = np.flatnonzero(
+                (relative_signal >= max(relative_threshold * 0.45, 0.025))
+                & (presence_fraction >= max(min_presence_fraction * 0.5, 0.1))
+                & candidate_mask
+            )
+            if fallback_idx.size == 0:
+                fallback_idx = np.flatnonzero(candidate_mask)
+            if fallback_idx.size == 0:
+                fallback_idx = np.arange(n_features)
+            best_start = int(fallback_idx[0])
+            best_end = int(fallback_idx[-1])
+
+    final_mask = np.zeros(n_features, dtype=bool)
+    final_mask[best_start : best_end + 1] = True
+    selected_quality = combined_quality[strict_mask]
+    quality_threshold = (
+        float(np.min(selected_quality))
+        if selected_quality.size
+        else float(np.quantile(combined_quality[candidate_mask], 0.35))
+    )
+
+    return InformativeRegion(
+        low=float(dataset.wavenumber[best_start]),
+        high=float(dataset.wavenumber[best_end]),
+        mask=final_mask,
+        quality=combined_quality,
+        threshold=quality_threshold,
+    )
+
+
+def _preferred_region_bounds(wavenumber: np.ndarray) -> tuple[int | None, int | None]:
+    available_ranges: list[tuple[int, int]] = []
+    for low, high in CLINICALLY_PRIORITIZED_REGIONS:
+        mask = (wavenumber >= low) & (wavenumber <= high)
+        if np.any(mask):
+            indices = np.flatnonzero(mask)
+            available_ranges.append((int(indices[0]), int(indices[-1])))
+
+    if len(available_ranges) < 4:
+        return None, None
+
+    start = min(region_start for region_start, _ in available_ranges)
+    end = max(region_end for _, region_end in available_ranges)
+    return start, end
+
+
+def _candidate_wavenumber_mask(
+    wavenumber: np.ndarray,
+    preferred_bounds: tuple[float, float],
+) -> np.ndarray:
+    low, high = preferred_bounds
+    mask = (wavenumber >= low) & (wavenumber <= high)
+    if np.any(mask):
+        return mask
+    return np.ones_like(wavenumber, dtype=bool)
 
 
 def detect_spectral_peaks(
@@ -479,3 +626,46 @@ def _expand_from_seed(
         right += 1
 
     return left, right
+
+
+def _best_mask_interval(
+    mask: np.ndarray,
+    quality: np.ndarray,
+    min_points: int,
+) -> tuple[int | None, int | None]:
+    best_start: int | None = None
+    best_end: int | None = None
+    best_score = -np.inf
+
+    start: int | None = None
+    for idx, flag in enumerate(mask):
+        if flag and start is None:
+            start = idx
+        if not flag and start is not None:
+            end = idx - 1
+            score = _interval_score(start, end, quality, min_points)
+            if score > best_score:
+                best_score = score
+                best_start, best_end = start, end
+            start = None
+
+    if start is not None:
+        end = len(mask) - 1
+        score = _interval_score(start, end, quality, min_points)
+        if score > best_score:
+            best_start, best_end = start, end
+
+    if best_start is not None and best_end is not None and (best_end - best_start + 1) < min_points:
+        center = (best_start + best_end) // 2
+        half = min_points // 2
+        best_start = max(0, center - half)
+        best_end = min(len(mask) - 1, best_start + min_points - 1)
+        best_start = max(0, best_end - min_points + 1)
+
+    return best_start, best_end
+
+
+def _interval_score(start: int, end: int, quality: np.ndarray, min_points: int) -> float:
+    segment = quality[start : end + 1]
+    length = end - start + 1
+    return float(segment.mean() * max(length, min_points))

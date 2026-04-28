@@ -3,9 +3,15 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from dotenv import load_dotenv
+
+
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 
 
 @dataclass

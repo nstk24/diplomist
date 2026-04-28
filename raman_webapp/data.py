@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import io
 import json
+import re
+from typing import BinaryIO
 
 import numpy as np
 import pandas as pd
@@ -80,10 +82,10 @@ HOLDOUT_SAMPLE_NAMES = {
 }
 
 
-def load_raw_excel(path: str | Path) -> RawDataset:
-    path = Path(path)
-    df_health = pd.read_excel(path, sheet_name="health")
-    df_disease = pd.read_excel(path, sheet_name="heart disease")
+def load_raw_excel(path: str | Path | BinaryIO | io.BytesIO) -> RawDataset:
+    excel_source = Path(path) if isinstance(path, (str, Path)) else path
+    df_health = pd.read_excel(excel_source, sheet_name="health")
+    df_disease = pd.read_excel(excel_source, sheet_name="heart disease")
 
     wavenumber = df_health["wavenumber"].to_numpy(dtype=float)
     x_health = df_health.drop(columns=["wavenumber"]).T.to_numpy(dtype=float)
@@ -179,9 +181,13 @@ def split_train_holdout(dataset: ProcessedDataset) -> tuple[ProcessedDataset, Pr
     if dataset.sample_names is None:
         raise ValueError("Dataset sample names are required for holdout splitting.")
 
-    holdout_mask = np.isin(dataset.sample_names, list(HOLDOUT_SAMPLE_NAMES))
-    if holdout_mask.sum() != len(HOLDOUT_SAMPLE_NAMES):
-        missing = sorted(HOLDOUT_SAMPLE_NAMES.difference(set(dataset.sample_names.tolist())))
+    normalized_holdout_names = {_normalize_sample_name(name) for name in HOLDOUT_SAMPLE_NAMES}
+    normalized_sample_names = np.array([_normalize_sample_name(name) for name in dataset.sample_names], dtype=str)
+
+    holdout_mask = np.isin(normalized_sample_names, list(normalized_holdout_names))
+    matched_holdout_names = set(normalized_sample_names[holdout_mask].tolist())
+    if len(matched_holdout_names) != len(normalized_holdout_names):
+        missing = sorted(normalized_holdout_names.difference(matched_holdout_names))
         raise ValueError(f"Could not locate all holdout samples in dataset: {missing}")
 
     train_dataset = dataset.subset_by_mask(~holdout_mask)
@@ -189,14 +195,31 @@ def split_train_holdout(dataset: ProcessedDataset) -> tuple[ProcessedDataset, Pr
     return train_dataset, holdout_dataset
 
 
-def load_reference_band_library(path: str | Path | None = None) -> pd.DataFrame:
+def load_reference_band_library(
+    path: str | Path | None = None,
+    spectroscopy_mode: str = "raman",
+) -> pd.DataFrame:
     if path is None:
-        path = Path(__file__).resolve().parent / "reference_bands.json"
+        file_name = "sers_reference_peaks.json" if spectroscopy_mode == "sers" else "reference_bands.json"
+        path = Path(__file__).resolve().parent / file_name
     path = Path(path)
     records = json.loads(path.read_text(encoding="utf-8"))
     band_df = pd.DataFrame(records)
     if band_df.empty:
         return band_df
+
+    if spectroscopy_mode == "sers":
+        role_order = {"candidate": 0, "background": 1}
+        band_df["role_rank"] = band_df["peak_role"].map(role_order).fillna(99).astype(int)
+        if "shift_cm" not in band_df.columns:
+            band_df["shift_cm"] = np.nan
+        if "shift_min_cm" not in band_df.columns:
+            band_df["shift_min_cm"] = np.nan
+        if "shift_max_cm" not in band_df.columns:
+            band_df["shift_max_cm"] = np.nan
+        band_df["sort_position"] = band_df["shift_cm"].fillna(band_df["shift_min_cm"]).fillna(1e9)
+        band_df = band_df.sort_values(["role_rank", "sort_position", "shift_max_cm"]).reset_index(drop=True)
+        return band_df.drop(columns=["role_rank", "sort_position"], errors="ignore")
 
     priority_order = {"high": 0, "medium": 1, "support": 2}
     band_df["priority_rank"] = band_df["priority"].map(priority_order).fillna(99).astype(int)
@@ -272,3 +295,10 @@ def _guess_csv_format(text: str) -> tuple[str, str]:
     if tab_count > max(semicolon_count, comma_count):
         return "\t", "."
     return ",", "."
+
+
+def _normalize_sample_name(name: str) -> str:
+    normalized = str(name).strip().lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"_+", "_", normalized)
+    return normalized
