@@ -497,6 +497,7 @@ def match_peaks_to_reference_bands(
     if peaks_df.empty or reference_bands_df.empty:
         empty_matches = pd.DataFrame(
             columns=[
+                "band_id",
                 "rank_by_prominence",
                 "wavenumber_cm-1",
                 "match_type",
@@ -538,6 +539,7 @@ def match_peaks_to_reference_bands(
             band_center = 0.5 * (float(band["low_cm1"]) + float(band["high_cm1"]))
             match_rows.append(
                 {
+                    "band_id": str(band["band_id"]),
                     "rank_by_prominence": int(peak_row["rank_by_prominence"]),
                     "wavenumber_cm-1": peak_wn,
                     "intensity": float(peak_row["intensity"]),
@@ -558,6 +560,7 @@ def match_peaks_to_reference_bands(
         return PeakBandMatchResult(
             matched_peaks_df=pd.DataFrame(
                 columns=[
+                    "band_id",
                     "rank_by_prominence",
                     "wavenumber_cm-1",
                     "match_type",
@@ -597,6 +600,7 @@ def match_peaks_to_reference_bands(
     return PeakBandMatchResult(
         matched_peaks_df=matched_df[
             [
+                "band_id",
                 "rank_by_prominence",
                 "wavenumber_cm-1",
                 "match_type",

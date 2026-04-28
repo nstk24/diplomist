@@ -45,6 +45,12 @@ from raman_webapp.spectroscopy import (
     get_spectroscopy_mode_label,
     normalize_spectroscopy_mode,
 )
+from raman_webapp.spectral_references import (
+    add_reference_comparison,
+    compute_reference_peak_statistics,
+    normalize_aggregation_mode,
+    summarize_reference_comparison,
+)
 from raman_webapp.visuals import (
     boxplot_snr_figure,
     coefficient_figure,
@@ -253,6 +259,108 @@ def _format_sers_detected_peaks_df(peaks_df: pd.DataFrame) -> pd.DataFrame:
         "Примечания",
     ]
     return display_df[[column for column in preferred_columns if column in display_df.columns]]
+
+
+def _prediction_label_to_russian(label: str) -> str:
+    return {
+        "Healthy": "спектральный профиль нормы",
+        "Disease": "патологический спектральный профиль",
+    }.get(str(label), str(label))
+
+
+def _format_reference_comparison_df(peaks_df: pd.DataFrame, spectroscopy_mode: str) -> pd.DataFrame:
+    if peaks_df.empty:
+        return peaks_df
+    mode = normalize_spectroscopy_mode(spectroscopy_mode)
+    display_df = peaks_df.copy()
+    rename_map = {
+        "expected_position_cm": "Ожидаемый пик, см⁻¹",
+        "measured_shift_cm": "Найденный пик, см⁻¹",
+        "group": "Группа признаков",
+        "label": "Группа признаков",
+        "assignment": "Молекулярное отнесение",
+        "patient_reference_intensity": "Интенсивность пациента",
+        "mean_healthy": "Среднее у здоровых",
+        "std_healthy": "Std у здоровых",
+        "median_healthy": "Медиана у здоровых",
+        "iqr_healthy": "IQR у здоровых",
+        "mean_disease": "Среднее у больных",
+        "std_disease": "Std у больных",
+        "z_score": "Z-score",
+        "deviation_label": "Отклонение от контроля",
+        "interpretation": "Интерпретация",
+        "clinical_hint": "Интерпретация",
+        "reliability": "Надёжность",
+        "reference_warning": "Предупреждение по сравнению",
+        "notes": "Примечания",
+    }
+    display_df = display_df.rename(columns=rename_map)
+    if mode == "raman":
+        preferred = [
+            "Ожидаемый пик, см⁻¹",
+            "Найденный пик, см⁻¹",
+            "Группа признаков",
+            "Молекулярное отнесение",
+            "Интенсивность пациента",
+            "Среднее у здоровых",
+            "Std у здоровых",
+            "Z-score",
+            "Отклонение от контроля",
+            "Интерпретация",
+            "Предупреждение по сравнению",
+            "Примечания",
+        ]
+    else:
+        preferred = [
+            "Ожидаемый пик, см⁻¹",
+            "Найденный пик, см⁻¹",
+            "Группа признаков",
+            "Молекулярное отнесение",
+            "Интенсивность пациента",
+            "Среднее у здоровых",
+            "Std у здоровых",
+            "Медиана у здоровых",
+            "IQR у здоровых",
+            "Среднее у больных",
+            "Std у больных",
+            "Z-score",
+            "Отклонение от контроля",
+            "Интерпретация",
+            "Надёжность",
+            "Предупреждение по сравнению",
+            "Примечания",
+        ]
+    return display_df[[column for column in preferred if column in display_df.columns]]
+
+
+def _aggregation_mode_to_russian(aggregation_mode: str) -> str:
+    return {
+        "max": "максимум в зоне",
+        "mean": "среднее по зоне",
+        "area": "площадь под кривой",
+    }.get(normalize_aggregation_mode(aggregation_mode), aggregation_mode)
+
+
+def _reference_deviation_counts(peaks_df: pd.DataFrame) -> tuple[int, int, int, int]:
+    if peaks_df.empty or "deviation_label" not in peaks_df.columns:
+        return 0, 0, 0, 0
+    labels = peaks_df["deviation_label"].astype(str)
+    higher_count = int(labels.str.contains("выше контрольной группы", na=False).sum())
+    lower_count = int(labels.str.contains("ниже контрольной группы", na=False).sum())
+    normal_count = int((labels == "в пределах условной спектральной нормы контрольной группы").sum())
+    unknown_count = int(labels.str.contains("Недостаточно данных", na=False).sum())
+    return higher_count, lower_count, normal_count, unknown_count
+
+
+def _band_window_from_library_row(reference_row: pd.Series, spectroscopy_mode: str) -> tuple[float, float]:
+    mode = normalize_spectroscopy_mode(spectroscopy_mode)
+    if mode == "sers":
+        if pd.notna(reference_row.get("shift_min_cm")) and pd.notna(reference_row.get("shift_max_cm")):
+            return float(reference_row["shift_min_cm"]), float(reference_row["shift_max_cm"])
+        center = float(reference_row["shift_cm"])
+        tolerance = float(reference_row.get("tolerance_cm", SERS_DEFAULT_TOLERANCE_CM))
+        return center - tolerance, center + tolerance
+    return float(reference_row["low_cm1"]), float(reference_row["high_cm1"])
 
 
 def interpretation_block(dataset: ProcessedDataset, snr_summary: dict[str, float | pd.DataFrame], modeling_report) -> str:
@@ -676,19 +784,20 @@ with tab_interpret:
 
 with tab_patient_prediction:
     modeling_report = get_modeling_report(model_dataset)
+    st.subheader("Прогноз состояния пациента")
     st.write(
-        "Upload a patient spectrum as CSV. Supported formats: "
-        "two numeric columns (`wavenumber`, `intensity`), one intensity column with the same length as the reference axis, "
-        "or one row of intensities with the same length as the reference axis."
+        "Загрузите CSV-файл спектра пациента. Поддерживаются форматы: "
+        "две числовые колонки (`wavenumber`, `intensity`), одна колонка интенсивности той же длины, "
+        "что и эталонная ось, или одна строка интенсивностей той же длины."
     )
     if holdout_dataset is not None:
         st.caption(
-            "The deployment model in this tab is trained only on the training subset. "
-            "The 10 CSV files in `patient_csv_exports` remain honest holdout examples."
+            "Модель в этой вкладке обучена только на тренировочной части датасета. "
+            "Файлы из `patient_csv_exports` остаются независимыми holdout-примерами."
         )
     else:
-        st.caption("The deployment model in this tab is trained on the full selected dataset.")
-    uploaded_file = st.file_uploader("Patient spectrum CSV", type=["csv"], key="patient_csv")
+        st.caption("Модель в этой вкладке обучена на всём выбранном датасете.")
+    uploaded_file = st.file_uploader("Загрузите CSV-файл спектра пациента", type=["csv"], key="patient_csv")
 
     if uploaded_file is not None:
         try:
@@ -718,328 +827,461 @@ with tab_patient_prediction:
             else:
                 st.success("Проверка качества спектра пройдена.")
             st.write(str(quality["reason"]))
-
-            st.subheader("Поиск пиков на загруженном спектре")
-            st.write(
-                "Этот блок ищет локальные максимумы прямо на загруженном спектре. "
-                "Он нужен для интерпретации врачом и не используется самой моделью классификации."
-            )
-            peak_col1, peak_col2, peak_col3 = st.columns(3)
-            peak_prominence = peak_col1.number_input(
-                "Минимальная prominence пика",
-                min_value=0.001,
-                max_value=5.0,
-                value=0.08,
-                step=0.01,
-                format="%.3f",
-                key="peak_prominence",
-            )
-            peak_distance = peak_col2.number_input(
-                "Минимальное расстояние между пиками (см⁻¹)",
-                min_value=1.0,
-                max_value=200.0,
-                value=12.0,
-                step=1.0,
-                key="peak_distance",
-            )
-            peak_top_k = int(
-                peak_col3.number_input(
-                    "Сколько пиков показать",
-                    min_value=3,
-                    max_value=50,
-                    value=15,
-                    step=1,
-                    key="peak_top_k",
-                )
-            )
-            match_col1, match_col2 = st.columns(2)
-            peak_matching_mode_label = match_col1.radio(
-                "Режим сопоставления с библиотекой",
-                ["Близкое совпадение", "Точное совпадение"],
-                index=0,
-                horizontal=True,
-                help="По умолчанию используется близкое совпадение: пик может немного выходить за границы полосы.",
-            )
-            peak_tolerance_cm = match_col2.number_input(
-                "Допуск для близкого совпадения (см⁻¹)",
-                min_value=0.0,
-                max_value=20.0,
-                value=float(SERS_DEFAULT_TOLERANCE_CM if spectroscopy_mode == "sers" else 5.0),
-                step=0.5,
-                format="%.1f",
-                key="peak_tolerance_cm",
-                disabled=peak_matching_mode_label != "Близкое совпадение",
-            )
-
-            peak_basis_mode = st.radio(
-                "Основа для поиска пиков",
-                ["Исходная загруженная интенсивность", "Выровненный спектр после baseline correction"],
-                index=1,
-                horizontal=True,
-                help="Исходная интенсивность сохраняет оригинальные значения из файла. После baseline correction пики часто визуально интерпретировать проще.",
-            )
-
-            if peak_basis_mode == "Выровненный спектр после baseline correction":
-                peak_plot_wavenumber = dataset.wavenumber
-                peak_plot_intensity = external.baseline_corrected
-                peak_plot_result = detect_spectral_peaks(
-                    peak_plot_wavenumber,
-                    peak_plot_intensity,
-                    prominence=float(peak_prominence),
-                    min_distance_cm=float(peak_distance),
-                    top_k=peak_top_k,
-                )
-                peak_y_axis_title = "Интенсивность после baseline correction"
-            else:
-                peak_plot_wavenumber = external.source_wavenumber
-                peak_plot_intensity = external.source_intensity
-                peak_plot_result = detect_spectral_peaks(
-                    peak_plot_wavenumber,
-                    peak_plot_intensity,
-                    prominence=float(peak_prominence),
-                    min_distance_cm=float(peak_distance),
-                    top_k=peak_top_k,
-                )
-                peak_y_axis_title = "Загруженная интенсивность"
-
-            peak_analysis_result = analyze_spectroscopy_peaks(
-                peaks_df=peak_plot_result.peaks_df,
-                wavenumber=peak_plot_wavenumber,
-                intensity=peak_plot_intensity,
-                reference_library_df=reference_band_library,
-                spectroscopy_mode=spectroscopy_mode,
-                matching_mode="close" if peak_matching_mode_label == "Близкое совпадение" else "exact",
-                tolerance_cm=float(peak_tolerance_cm),
-            )
-            annotated_peak_df = annotate_peak_importance(peak_plot_result.peaks_df, spectral_importance)
-            peak_labels_by_wavenumber: dict[float, str] = {}
-            if spectroscopy_mode == "raman":
-                for _, row in peak_analysis_result.matched_peaks_df.iterrows():
-                    peak_wn = float(row["wavenumber_cm-1"])
-                    if peak_wn not in peak_labels_by_wavenumber:
-                        peak_labels_by_wavenumber[peak_wn] = (
-                            f"{row['label']} ({_match_type_to_russian(str(row['match_type']))})"
-                        )
-            else:
-                for _, row in peak_analysis_result.matched_peaks_df.iterrows():
-                    if bool(row["peak_present"]):
-                        peak_wn = float(row["measured_shift_cm"])
-                        if peak_wn not in peak_labels_by_wavenumber:
-                            peak_labels_by_wavenumber[peak_wn] = str(row["group"])
-            peak_text = [
-                peak_labels_by_wavenumber.get(float(peak_plot_wavenumber[idx]), "")
-                for idx in peak_plot_result.peak_indices
-            ]
-
-            st.plotly_chart(
-                peak_detection_figure(
-                    peak_plot_wavenumber,
-                    peak_plot_intensity,
-                    peak_plot_result.peak_indices,
-                    "Найденные локальные пики на спектре пациента",
-                    peak_y_axis_title,
-                    peak_text=peak_text,
-                ),
-                use_container_width=True,
-            )
-
-            if peak_plot_result.peaks_df.empty:
-                st.info("С текущими порогами пики не найдены. Попробуй уменьшить минимальную prominence.")
-            else:
-                peak_display_df = annotated_peak_df.copy()
-                peak_display_df["class_importance_priority"] = peak_display_df["class_importance_priority"].map(
-                    _priority_to_russian
-                )
-                peak_display_df = peak_display_df.rename(
-                    columns={
-                        "rank_by_prominence": "Ранг",
-                        "wavenumber_cm-1": "Волновое число, см⁻¹",
-                        "intensity": "Интенсивность",
-                        "prominence": "Prominence",
-                        "width_cm-1": "Ширина, см⁻¹",
-                        "class_importance_score": "Значимость по различию классов",
-                        "class_importance_priority": "Приоритет по различию классов",
-                    }
-                )
-                st.dataframe(peak_display_df, use_container_width=True)
-                st.caption(
-                    "Значимость по различию классов рассчитывается по разности средних спектров Healthy и Disease, "
-                    "нормированной на разброс. Это локальная оценка того, насколько область помогает разделять классы в обучающем датасете."
-                )
-
-                st.subheader("Интерпретация найденных пиков")
-                st.markdown(peak_analysis_result.interpretation)
-                for warning_text in peak_analysis_result.warnings:
-                    st.warning(warning_text)
-
-                if spectroscopy_mode == "raman":
-                    if peak_analysis_result.matched_peaks_df.empty:
-                        st.info(
-                            "Ни один из найденных пиков не попал в текущую библиотеку характерных полос. "
-                            "Это не означает отсутствие изменений, только отсутствие совпадений с локальной базой."
-                        )
-                    else:
-                        summary_display_df = peak_analysis_result.summary_df.copy()
-                        summary_display_df["priority"] = summary_display_df["priority"].map(_priority_to_russian)
-                        summary_display_df["match_type"] = summary_display_df["match_type"].map(_match_type_to_russian)
-                        summary_display_df = summary_display_df.rename(
-                            columns={
-                                "priority": "Приоритет",
-                                "match_type": "Тип совпадения",
-                                "n_matches": "Количество совпадений",
-                                "labels": "Совпавшие полосы",
-                            }
-                        )
-                        st.dataframe(summary_display_df, use_container_width=True)
-
-                        matched_display_df = peak_analysis_result.matched_peaks_df.copy()
-                        matched_display_df["priority"] = matched_display_df["priority"].map(_priority_to_russian)
-                        matched_display_df["match_type"] = matched_display_df["match_type"].map(_match_type_to_russian)
-                        matched_display_df = matched_display_df.merge(
-                            annotated_peak_df[
-                                [
-                                    "rank_by_prominence",
-                                    "wavenumber_cm-1",
-                                    "class_importance_score",
-                                    "class_importance_priority",
-                                ]
-                            ],
-                            on=["rank_by_prominence", "wavenumber_cm-1"],
-                            how="left",
-                        )
-                        matched_display_df["class_importance_priority"] = matched_display_df["class_importance_priority"].map(
-                            _priority_to_russian
-                        )
-                        matched_display_df = matched_display_df.rename(
-                            columns={
-                                "rank_by_prominence": "Ранг пика",
-                                "wavenumber_cm-1": "Волновое число, см⁻¹",
-                                "match_type": "Тип совпадения",
-                                "priority": "Приоритет",
-                                "class_importance_priority": "Приоритет по различию классов",
-                                "class_importance_score": "Значимость по различию классов",
-                                "label": "Полоса",
-                                "assignment": "Предполагаемая группа",
-                                "clinical_hint": "Клиническая подсказка",
-                                "notes": "Примечание",
-                                "distance_to_band_center_cm-1": "Отклонение от центра полосы, см⁻¹",
-                            }
-                        )
-                        st.dataframe(matched_display_df, use_container_width=True)
-                else:
-                    st.caption(f"Выбран режим: {get_spectroscopy_mode_label(spectroscopy_mode)}.")
-                    if peak_analysis_result.summary_df.empty:
-                        st.info("Кандидатные или фоновые SERS-признаки в текущем спектре не выделены.")
-                    else:
-                        st.dataframe(_format_sers_summary_df(peak_analysis_result.summary_df), use_container_width=True)
-
-                    sers_metrics = st.columns(4)
-                    sers_metrics[0].metric("Кандидатные SERS-пики", peak_analysis_result.candidate_peak_count)
-                    sers_metrics[1].metric("Фоновые SERS-пики", peak_analysis_result.background_peak_count)
-                    sers_metrics[2].metric(
-                        "Оценка SERS-CVD",
-                        f"{peak_analysis_result.sers_cvd_score:.2f}" if peak_analysis_result.sers_cvd_score is not None else "0.00",
-                    )
-                    sers_metrics[3].metric(
-                        "Уровень SERS-паттерна",
-                        peak_analysis_result.sers_cvd_pattern_level or "не определен",
-                    )
-
-                    st.subheader("Кандидатные SERS-пики")
-                    if peak_analysis_result.detected_candidate_peaks_df.empty:
-                        st.info("Кандидатные SERS-пики не найдены.")
-                    else:
-                        st.dataframe(
-                            _format_sers_detected_peaks_df(peak_analysis_result.detected_candidate_peaks_df),
-                            use_container_width=True,
-                        )
-
-                    st.subheader("Фоновые SERS-признаки сыворотки")
-                    if peak_analysis_result.detected_background_peaks_df.empty:
-                        st.info("Фоновые SERS-пики сыворотки не найдены.")
-                    else:
-                        st.dataframe(
-                            _format_sers_detected_peaks_df(peak_analysis_result.detected_background_peaks_df),
-                            use_container_width=True,
-                        )
-
             prediction = predict_patient(modeling_report, external_model_vector)
-
-            pred_cols = st.columns(3)
-            pred_cols[0].metric("Предсказанный класс", prediction["predicted_label"])
-            pred_cols[1].metric("Вероятность заболевания", f"{prediction['probability_disease']:.3f}")
-            pred_cols[2].metric("Вероятность нормы", f"{prediction['probability_healthy']:.3f}")
+            st.subheader("Результат прогноза")
+            pred_cols = st.columns(4)
+            pred_cols[0].metric("Режим анализа", get_spectroscopy_mode_label(spectroscopy_mode))
+            pred_cols[1].metric("Предсказанный класс", _prediction_label_to_russian(str(prediction["predicted_label"])))
+            pred_cols[2].metric(
+                "Вероятность патологического спектрального профиля",
+                f"{prediction['probability_disease']:.3f}",
+            )
+            pred_cols[3].metric("Вероятность нормы", f"{prediction['probability_healthy']:.3f}")
+            st.warning(
+                "Результат не является медицинским диагнозом. Прогноз основан на сходстве спектра с группами обучающего датасета."
+            )
             if spectroscopy_mode == "sers":
                 st.warning(
-                    "Текущая модель машинного обучения обучена на имеющемся рабочем датасете проекта. "
-                    "При выборе SERS-режима пиковая интерпретация выполняется по отдельному SERS-справочнику и не должна "
-                    "рассматриваться как эквивалент обычной рамановской спектроскопии."
+                    "При выборе SERS-режима интерпретация пиков выполняется по отдельному SERS-справочнику и не должна считаться эквивалентом обычной рамановской спектроскопии."
                 )
-
-            st.subheader("Gemini: гипотезы по спектральным областям")
-            gemini_ready, gemini_status = is_gemini_configured()
-            if gemini_ready:
-                st.caption(
-                    "Gemini получает только агрегированные спектральные области пиков и краткий контекст. "
-                    "Сырые массивы спектра и наши грубые назначения веществ не отправляются."
-                )
-            else:
-                st.info(
-                    "Gemini сейчас недоступен. "
-                    f"{gemini_status} Запусти приложение из того же терминала, где задан GEMINI_API_KEY."
-                )
-
-            gemini_button = st.button(
-                "Сгенерировать гипотезы через Gemini",
-                key="gemini_generate_hypotheses",
-                disabled=not gemini_ready or peak_plot_result.peaks_df.empty,
-            )
-            gemini_state_key = "gemini_hypotheses_response"
-            if gemini_button:
-                with st.spinner("Gemini анализирует спектральные области..."):
-                    gemini_result = generate_gemini_hypotheses(
-                        peaks_df=annotated_peak_df,
-                        prediction_probability_disease=float(prediction["probability_disease"]),
-                        peak_basis_label=peak_basis_mode,
-                        spectrum_quality_text=str(quality["reason"]),
-                        model_name=str(modeling_report.final_selected_model_name),
-                    )
-                st.session_state[gemini_state_key] = {
-                    "ok": gemini_result.ok,
-                    "text": gemini_result.text,
-                    "prompt_payload": gemini_result.prompt_payload,
-                    "model_used": gemini_result.model_used,
-                }
-
-            gemini_state = st.session_state.get(gemini_state_key)
-            if gemini_state:
-                if gemini_state["ok"]:
-                    st.warning(
-                        "Ниже приведена модельная интерпретация для поддержки врача. "
-                        "Это не диагноз и не подтверждение конкретного вещества."
-                    )
-                    if gemini_state.get("model_used"):
-                        st.caption(f"Ответ получен от модели: `{gemini_state['model_used']}`")
-                    st.markdown(gemini_state["text"])
-                    with st.expander("Какие данные были отправлены в Gemini", expanded=False):
-                        st.json(gemini_state["prompt_payload"])
-                else:
-                    st.error(str(gemini_state["text"]))
 
             mean_healthy = model_dataset.X[model_dataset.y == 0].mean(axis=0)
             mean_disease = model_dataset.X[model_dataset.y == 1].mean(axis=0)
             patient_fig = spectrum_line_figure(
                 model_dataset.wavenumber,
                 [mean_healthy, mean_disease, external_model_vector],
-                ["Healthy mean", "Disease mean", "Patient spectrum"],
-                f"Patient spectrum vs class means ({modeling_low:.0f}-{modeling_high:.0f} cm^-1)",
-                "SNV intensity",
+                ["Средний профиль нормы", "Средний патологический профиль", "Спектр пациента"],
+                f"Сравнение спектра пациента со средними профилями ({modeling_low:.0f}-{modeling_high:.0f} см⁻¹)",
+                "SNV-интенсивность",
             )
             st.plotly_chart(patient_fig, use_container_width=True)
-
             st.caption(
-                f"Prediction uses deployment pipeline: {modeling_report.final_selected_model_name} "
-                f"on modeling region {modeling_region_label}."
+                f"Прогноз построен моделью `{modeling_report.final_selected_model_name}` в диапазоне {modeling_region_label}."
             )
+
+            with st.expander("Показать интерпретацию пиков", expanded=False):
+                st.write(
+                    "Этот блок ищет локальные максимумы на спектре пациента и формирует дополнительную спектральную интерпретацию. "
+                    "Он не изменяет результат модели, а помогает его интерпретировать."
+                )
+                peak_col1, peak_col2, peak_col3 = st.columns(3)
+                peak_prominence = peak_col1.number_input(
+                    "Минимальная prominence пика",
+                    min_value=0.001,
+                    max_value=5.0,
+                    value=0.08,
+                    step=0.01,
+                    format="%.3f",
+                    key="peak_prominence",
+                )
+                peak_distance = peak_col2.number_input(
+                    "Минимальное расстояние между пиками (см⁻¹)",
+                    min_value=1.0,
+                    max_value=200.0,
+                    value=12.0,
+                    step=1.0,
+                    key="peak_distance",
+                )
+                peak_top_k = int(
+                    peak_col3.number_input(
+                        "Сколько пиков показать",
+                        min_value=3,
+                        max_value=50,
+                        value=15,
+                        step=1,
+                        key="peak_top_k",
+                    )
+                )
+                match_col1, match_col2 = st.columns(2)
+                peak_matching_mode_label = match_col1.radio(
+                    "Режим сопоставления с библиотекой",
+                    ["Близкое совпадение", "Точное совпадение"],
+                    index=0,
+                    horizontal=True,
+                    help="По умолчанию используется близкое совпадение: пик может немного выходить за границы полосы.",
+                )
+                peak_tolerance_cm = match_col2.number_input(
+                    "Допуск для близкого совпадения (см⁻¹)",
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=float(SERS_DEFAULT_TOLERANCE_CM if spectroscopy_mode == "sers" else 5.0),
+                    step=0.5,
+                    format="%.1f",
+                    key="peak_tolerance_cm",
+                    disabled=peak_matching_mode_label != "Близкое совпадение",
+                )
+
+                peak_basis_mode = st.radio(
+                    "Основа для поиска пиков",
+                    ["SNV-нормированный спектр пациента", "Выровненный спектр после baseline correction"],
+                    index=1,
+                    horizontal=True,
+                    help="Для сравнения с контрольной группой используется тот же тип интенсивности, что и для спектра пациента.",
+                )
+                reference_aggregation_label = st.radio(
+                    "Как сравнивать интенсивность зоны с контрольной группой",
+                    ["Максимум в зоне", "Среднее по зоне", "Площадь под кривой"],
+                    index=0,
+                    horizontal=True,
+                    help="Для широких зон среднее или площадь часто устойчивее, чем локальный максимум.",
+                )
+                reference_aggregation_mode = {
+                    "Максимум в зоне": "max",
+                    "Среднее по зоне": "mean",
+                    "Площадь под кривой": "area",
+                }[reference_aggregation_label]
+                if peak_basis_mode == "Выровненный спектр после baseline correction":
+                    peak_plot_wavenumber = dataset.wavenumber
+                    peak_plot_intensity = external.baseline_corrected
+                    reference_intensity_basis = "baseline_corrected"
+                    peak_plot_result = detect_spectral_peaks(
+                        peak_plot_wavenumber,
+                        peak_plot_intensity,
+                        prominence=float(peak_prominence),
+                        min_distance_cm=float(peak_distance),
+                        top_k=peak_top_k,
+                    )
+                    peak_y_axis_title = "Интенсивность после baseline correction"
+                else:
+                    peak_plot_wavenumber = dataset.wavenumber
+                    peak_plot_intensity = external.snv_processed
+                    reference_intensity_basis = "snv"
+                    peak_plot_result = detect_spectral_peaks(
+                        peak_plot_wavenumber,
+                        peak_plot_intensity,
+                        prominence=float(peak_prominence),
+                        min_distance_cm=float(peak_distance),
+                        top_k=peak_top_k,
+                    )
+                    peak_y_axis_title = "SNV-интенсивность"
+
+                peak_analysis_result = analyze_spectroscopy_peaks(
+                    peaks_df=peak_plot_result.peaks_df,
+                    wavenumber=peak_plot_wavenumber,
+                    intensity=peak_plot_intensity,
+                    reference_library_df=reference_band_library,
+                    spectroscopy_mode=spectroscopy_mode,
+                    matching_mode="close" if peak_matching_mode_label == "Близкое совпадение" else "exact",
+                    tolerance_cm=float(peak_tolerance_cm),
+                )
+                reference_stats_df = compute_reference_peak_statistics(
+                    dataset=dataset,
+                    reference_library_df=reference_band_library,
+                    spectroscopy_mode=spectroscopy_mode,
+                    intensity_basis=reference_intensity_basis,
+                    aggregation_mode=reference_aggregation_mode,
+                )
+                annotated_peak_df = annotate_peak_importance(peak_plot_result.peaks_df, spectral_importance)
+                peak_labels_by_wavenumber: dict[float, str] = {}
+                if spectroscopy_mode == "raman":
+                    for _, row in peak_analysis_result.matched_peaks_df.iterrows():
+                        peak_wn = float(row["wavenumber_cm-1"])
+                        if peak_wn not in peak_labels_by_wavenumber:
+                            peak_labels_by_wavenumber[peak_wn] = (
+                                f"{row['label']} ({_match_type_to_russian(str(row['match_type']))})"
+                            )
+                else:
+                    for _, row in peak_analysis_result.matched_peaks_df.iterrows():
+                        if bool(row["peak_present"]):
+                            peak_wn = float(row["measured_shift_cm"])
+                            if peak_wn not in peak_labels_by_wavenumber:
+                                peak_labels_by_wavenumber[peak_wn] = str(row["group"])
+                peak_text = [
+                    peak_labels_by_wavenumber.get(float(peak_plot_wavenumber[idx]), "")
+                    for idx in peak_plot_result.peak_indices
+                ]
+
+                st.subheader("Спектральные признаки")
+                st.plotly_chart(
+                    peak_detection_figure(
+                        peak_plot_wavenumber,
+                        peak_plot_intensity,
+                        peak_plot_result.peak_indices,
+                        "Найденные локальные пики на спектре пациента",
+                        peak_y_axis_title,
+                        peak_text=peak_text,
+                    ),
+                    use_container_width=True,
+                )
+
+                if peak_plot_result.peaks_df.empty:
+                    st.info("С текущими порогами пики не найдены. Попробуйте уменьшить минимальную prominence.")
+                else:
+                    peak_display_df = annotated_peak_df.copy()
+                    peak_display_df["class_importance_priority"] = peak_display_df["class_importance_priority"].map(
+                        _priority_to_russian
+                    )
+                    peak_display_df = peak_display_df.rename(
+                        columns={
+                            "rank_by_prominence": "Ранг",
+                            "wavenumber_cm-1": "Волновое число, см⁻¹",
+                            "intensity": "Интенсивность",
+                            "prominence": "Prominence",
+                            "width_cm-1": "Ширина, см⁻¹",
+                            "class_importance_score": "Значимость по различию классов",
+                            "class_importance_priority": "Приоритет по различию классов",
+                        }
+                    )
+                    st.dataframe(peak_display_df, use_container_width=True)
+                    st.caption(
+                        "Значимость по различию классов показывает, насколько локальная область помогает разделять группы обучающего датасета."
+                    )
+
+                    st.subheader("Интерпретация найденных пиков")
+                    st.markdown(peak_analysis_result.interpretation)
+                    st.warning(
+                        "Отклонение интенсивности пика рассчитано относительно контрольной группы текущего датасета, а не относительно клинической нормы концентрации биомаркера."
+                    )
+                    st.warning("Наличие отдельного пика не доказывает наличие сердечно-сосудистого заболевания.")
+                    if spectroscopy_mode == "sers":
+                        st.warning("SERS-спектры зависят от типа подложки, пробоподготовки и условий регистрации.")
+                    else:
+                        st.warning("Интерпретация Raman-пиков зависит от качества спектра, предобработки и состава обучающего датасета.")
+                    for warning_text in peak_analysis_result.warnings:
+                        st.warning(warning_text)
+
+                    if spectroscopy_mode == "raman":
+                        summary_display_df = peak_analysis_result.summary_df.copy()
+                        if not summary_display_df.empty:
+                            summary_display_df["priority"] = summary_display_df["priority"].map(_priority_to_russian)
+                            summary_display_df["match_type"] = summary_display_df["match_type"].map(_match_type_to_russian)
+                            summary_display_df = summary_display_df.rename(
+                                columns={
+                                    "priority": "Приоритет",
+                                    "match_type": "Тип совпадения",
+                                    "n_matches": "Количество совпадений",
+                                    "labels": "Совпавшие полосы",
+                                }
+                            )
+                            st.dataframe(summary_display_df, use_container_width=True)
+
+                        reference_comparison_df = add_reference_comparison(
+                            peak_analysis_result.matched_peaks_df,
+                            reference_stats_df,
+                            patient_intensity_col="intensity",
+                            allow_reference_comparison=True,
+                            patient_wavenumber=peak_plot_wavenumber,
+                            patient_intensity=peak_plot_intensity,
+                            reference_library_df=reference_band_library,
+                            spectroscopy_mode=spectroscopy_mode,
+                            aggregation_mode=reference_aggregation_mode,
+                        )
+                        if reference_comparison_df.empty:
+                            st.info(
+                                "Ни один из найденных пиков не попал в текущую библиотеку характерных полос. Это не исключает наличие изменений, а только отсутствие совпадений со справочником."
+                            )
+                        else:
+                            st.subheader("Сравнение с контрольной группой")
+                            st.caption(
+                                f"Основа сравнения: {peak_y_axis_title.lower()}. Метрика зоны: {_aggregation_mode_to_russian(reference_aggregation_mode)}."
+                            )
+                            st.dataframe(
+                                _format_reference_comparison_df(reference_comparison_df, spectroscopy_mode),
+                                use_container_width=True,
+                            )
+                            higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(reference_comparison_df)
+                            st.info(
+                                "По сравнению с контрольной группой здоровых доноров "
+                                f"{higher_count} признаков имеют интенсивность выше условной спектральной нормы, "
+                                f"{lower_count} признаков ниже контрольной группы, "
+                                f"{normal_count} признаков находятся в пределах контрольного диапазона. "
+                                f"Для {unknown_count} признаков недостаточно данных для расчёта отклонения."
+                            )
+                            selected_band_id = st.selectbox(
+                                "Зона для локального референсного графика",
+                                reference_comparison_df["band_id"].astype(str).tolist(),
+                                format_func=lambda band_id: str(
+                                    reference_comparison_df.loc[
+                                        reference_comparison_df["band_id"].astype(str) == str(band_id),
+                                        "expected_position_cm",
+                                    ].iloc[0]
+                                ),
+                                key="raman_reference_band_plot",
+                            )
+                            reference_row = reference_band_library.loc[
+                                reference_band_library["band_id"].astype(str) == str(selected_band_id)
+                            ].iloc[0]
+                            band_low, band_high = _band_window_from_library_row(reference_row, spectroscopy_mode)
+                            plot_padding = 15.0
+                            plot_mask = (peak_plot_wavenumber >= band_low - plot_padding) & (peak_plot_wavenumber <= band_high + plot_padding)
+                            reference_X = dataset.X_snr if reference_intensity_basis == "baseline_corrected" and dataset.X_snr is not None else dataset.X
+                            healthy_profile = reference_X[dataset.y == 0].mean(axis=0)
+                            disease_profile = reference_X[dataset.y == 1].mean(axis=0) if np.any(dataset.y == 1) else np.full_like(healthy_profile, np.nan)
+                            st.plotly_chart(
+                                spectrum_line_figure(
+                                    peak_plot_wavenumber[plot_mask],
+                                    [
+                                        healthy_profile[plot_mask],
+                                        disease_profile[plot_mask],
+                                        peak_plot_intensity[plot_mask],
+                                    ],
+                                    ["Средний профиль нормы", "Средний патологический профиль", "Спектр пациента"],
+                                    f"Локальное сравнение в зоне {band_low:.2f}-{band_high:.2f} см⁻¹",
+                                    peak_y_axis_title,
+                                ),
+                                use_container_width=True,
+                            )
+                    else:
+                        st.caption(f"Выбран режим: {get_spectroscopy_mode_label(spectroscopy_mode)}.")
+                        if peak_analysis_result.summary_df.empty:
+                            st.info("Кандидатные или фоновые SERS-признаки в текущем спектре не выделены.")
+                        else:
+                            st.dataframe(_format_sers_summary_df(peak_analysis_result.summary_df), use_container_width=True)
+
+                        sers_metrics = st.columns(4)
+                        sers_metrics[0].metric("Кандидатные признаки патологии", peak_analysis_result.candidate_peak_count)
+                        sers_metrics[1].metric("Фоновые признаки сыворотки", peak_analysis_result.background_peak_count)
+                        sers_metrics[2].metric(
+                            "Оценка SERS-CVD",
+                            f"{peak_analysis_result.sers_cvd_score:.2f}" if peak_analysis_result.sers_cvd_score is not None else "0.00",
+                        )
+                        sers_metrics[3].metric(
+                            "Уровень SERS-паттерна",
+                            peak_analysis_result.sers_cvd_pattern_level or "не определён",
+                        )
+
+                        candidate_reference_df = add_reference_comparison(
+                            peak_analysis_result.detected_candidate_peaks_df,
+                            reference_stats_df,
+                            patient_intensity_col="intensity",
+                            allow_reference_comparison=True,
+                            patient_wavenumber=peak_plot_wavenumber,
+                            patient_intensity=peak_plot_intensity,
+                            reference_library_df=reference_band_library,
+                            spectroscopy_mode=spectroscopy_mode,
+                            aggregation_mode=reference_aggregation_mode,
+                        )
+                        background_reference_df = add_reference_comparison(
+                            peak_analysis_result.detected_background_peaks_df,
+                            reference_stats_df,
+                            patient_intensity_col="intensity",
+                            allow_reference_comparison=True,
+                            patient_wavenumber=peak_plot_wavenumber,
+                            patient_intensity=peak_plot_intensity,
+                            reference_library_df=reference_band_library,
+                            spectroscopy_mode=spectroscopy_mode,
+                            aggregation_mode=reference_aggregation_mode,
+                        )
+
+                        st.subheader("Кандидатные признаки патологии")
+                        if candidate_reference_df.empty:
+                            st.info("Кандидатные SERS-пики не найдены.")
+                        else:
+                            st.dataframe(
+                                _format_reference_comparison_df(candidate_reference_df, spectroscopy_mode),
+                                use_container_width=True,
+                            )
+
+                        st.subheader("Фоновые признаки сыворотки")
+                        if background_reference_df.empty:
+                            st.info("Фоновые SERS-пики сыворотки не найдены.")
+                        else:
+                            st.dataframe(
+                                _format_reference_comparison_df(background_reference_df, spectroscopy_mode),
+                                use_container_width=True,
+                            )
+
+                        combined_reference_df = pd.concat(
+                            [candidate_reference_df, background_reference_df],
+                            ignore_index=True,
+                        ) if not candidate_reference_df.empty or not background_reference_df.empty else pd.DataFrame()
+                        if not combined_reference_df.empty:
+                            st.subheader("Сравнение с контрольной группой")
+                            st.caption(
+                                f"Основа сравнения: {peak_y_axis_title.lower()}. Метрика зоны: {_aggregation_mode_to_russian(reference_aggregation_mode)}."
+                            )
+                            higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(combined_reference_df)
+                            st.info(
+                                "По сравнению с контрольной группой здоровых доноров "
+                                f"{higher_count} найденных признаков имеют интенсивность выше условной спектральной нормы, "
+                                f"{lower_count} признаков ниже контрольной группы, "
+                                f"{normal_count} признаков находятся в пределах контрольного диапазона. "
+                                f"Для {unknown_count} признаков недостаточно данных для расчёта отклонения."
+                            )
+                            st.caption(summarize_reference_comparison(candidate_reference_df, background_reference_df, spectroscopy_mode))
+                            selected_band_id = st.selectbox(
+                                "Зона для локального референсного графика",
+                                combined_reference_df["band_id"].astype(str).tolist(),
+                                format_func=lambda band_id: str(
+                                    combined_reference_df.loc[
+                                        combined_reference_df["band_id"].astype(str) == str(band_id),
+                                        "expected_position_cm",
+                                    ].iloc[0]
+                                ),
+                                key="sers_reference_band_plot",
+                            )
+                            reference_row = reference_band_library.loc[
+                                reference_band_library["band_id"].astype(str) == str(selected_band_id)
+                            ].iloc[0]
+                            band_low, band_high = _band_window_from_library_row(reference_row, spectroscopy_mode)
+                            plot_padding = 15.0
+                            plot_mask = (peak_plot_wavenumber >= band_low - plot_padding) & (peak_plot_wavenumber <= band_high + plot_padding)
+                            reference_X = dataset.X_snr if reference_intensity_basis == "baseline_corrected" and dataset.X_snr is not None else dataset.X
+                            healthy_profile = reference_X[dataset.y == 0].mean(axis=0)
+                            disease_profile = reference_X[dataset.y == 1].mean(axis=0) if np.any(dataset.y == 1) else np.full_like(healthy_profile, np.nan)
+                            st.plotly_chart(
+                                spectrum_line_figure(
+                                    peak_plot_wavenumber[plot_mask],
+                                    [
+                                        healthy_profile[plot_mask],
+                                        disease_profile[plot_mask],
+                                        peak_plot_intensity[plot_mask],
+                                    ],
+                                    ["Средний профиль нормы", "Средний патологический профиль", "Спектр пациента"],
+                                    f"Локальное сравнение в зоне {band_low:.2f}-{band_high:.2f} см⁻¹",
+                                    peak_y_axis_title,
+                                ),
+                                use_container_width=True,
+                            )
+
+                st.subheader("Gemini: гипотезы по спектральным областям")
+                gemini_ready, gemini_status = is_gemini_configured()
+                if gemini_ready:
+                    st.caption(
+                        "Gemini получает только агрегированные спектральные области пиков и краткий контекст. "
+                        "Сырые массивы спектра и наши грубые назначения веществ не отправляются."
+                    )
+                else:
+                    st.info(
+                        "Gemini сейчас недоступен. "
+                        f"{gemini_status} Запустите приложение из того же терминала, где задан GEMINI_API_KEY."
+                    )
+
+                gemini_button = st.button(
+                    "Сгенерировать гипотезы через Gemini",
+                    key="gemini_generate_hypotheses",
+                    disabled=not gemini_ready or peak_plot_result.peaks_df.empty,
+                )
+                gemini_state_key = "gemini_hypotheses_response"
+                if gemini_button:
+                    with st.spinner("Gemini анализирует спектральные области..."):
+                        gemini_result = generate_gemini_hypotheses(
+                            peaks_df=annotated_peak_df,
+                            prediction_probability_disease=float(prediction["probability_disease"]),
+                            peak_basis_label=peak_basis_mode,
+                            spectrum_quality_text=str(quality["reason"]),
+                            model_name=str(modeling_report.final_selected_model_name),
+                        )
+                    st.session_state[gemini_state_key] = {
+                        "ok": gemini_result.ok,
+                        "text": gemini_result.text,
+                        "prompt_payload": gemini_result.prompt_payload,
+                        "model_used": gemini_result.model_used,
+                    }
+
+                gemini_state = st.session_state.get(gemini_state_key)
+                if gemini_state:
+                    if gemini_state["ok"]:
+                        st.warning(
+                            "Ниже приведена модельная интерпретация для поддержки врача. "
+                            "Это не диагноз и не подтверждение конкретного вещества."
+                        )
+                        if gemini_state.get("model_used"):
+                            st.caption(f"Ответ получен от модели: `{gemini_state['model_used']}`")
+                        st.markdown(gemini_state["text"])
+                        with st.expander("Какие данные были отправлены в Gemini", expanded=False):
+                            st.json(gemini_state["prompt_payload"])
+                    else:
+                        st.error(str(gemini_state["text"]))
         except Exception as exc:
-            st.error(f"Could not process uploaded spectrum: {exc}")
+            st.error(f"Не удалось обработать загруженный спектр: {exc}")
