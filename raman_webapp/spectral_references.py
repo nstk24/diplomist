@@ -226,6 +226,123 @@ def summarize_reference_comparison(
     return " ".join([first_sentence, deviation_text])
 
 
+def evaluate_expected_sers_bands(
+    patient_wavenumber: np.ndarray,
+    patient_intensity: np.ndarray,
+    reference_library_df: pd.DataFrame,
+    reference_stats_df: pd.DataFrame,
+    aggregation_mode: str = "max",
+) -> pd.DataFrame:
+    mode = normalize_aggregation_mode(aggregation_mode)
+    patient_wavenumber = np.asarray(patient_wavenumber, dtype=float)
+    patient_intensity = np.asarray(patient_intensity, dtype=float)
+    stats_lookup = {
+        str(row["band_id"]): row for row in reference_stats_df.to_dict(orient="records") if "band_id" in row
+    }
+    rows: list[dict[str, Any]] = []
+    for band in reference_library_df.to_dict(orient="records"):
+        band_id = str(band["band_id"])
+        low, high = _get_band_window(band, "sers")
+        mask = (patient_wavenumber >= low) & (patient_wavenumber <= high)
+        stats_row = stats_lookup.get(band_id, {})
+        patient_reference_intensity = np.nan
+        measured_shift_cm = np.nan
+        peak_present = False
+        if np.any(mask):
+            region_values = np.asarray(patient_intensity[mask], dtype=float)
+            region_wavenumber = np.asarray(patient_wavenumber[mask], dtype=float)
+            patient_reference_intensity = _aggregate_region(region_values, region_wavenumber, mode)
+            if region_values.size > 0:
+                max_index = int(np.argmax(region_values))
+                measured_shift_cm = float(region_wavenumber[max_index])
+                peak_present = bool(np.nanmax(region_values) > 0)
+        comparison = compare_peak_to_reference(
+            patient_reference_intensity=patient_reference_intensity,
+            mean_healthy=stats_row.get("mean_healthy"),
+            std_healthy=stats_row.get("std_healthy"),
+        )
+        status_label = "обнаружен" if peak_present else "не обнаружен"
+        if pd.isna(patient_reference_intensity):
+            status_label = "недостаточно данных"
+        rows.append(
+            {
+                "band_id": band_id,
+                "peak_role": band.get("peak_role", "candidate"),
+                "expected_position_cm": _format_expected_position(band),
+                "expected_peak_cm": float(band["shift_cm"]) if pd.notna(band.get("shift_cm")) else np.nan,
+                "measured_shift_cm": measured_shift_cm,
+                "status": status_label,
+                "patient_reference_intensity": patient_reference_intensity,
+                "mean_healthy": stats_row.get("mean_healthy", np.nan),
+                "std_healthy": stats_row.get("std_healthy", np.nan),
+                "median_healthy": stats_row.get("median_healthy", np.nan),
+                "iqr_healthy": stats_row.get("iqr_healthy", np.nan),
+                "mean_disease": stats_row.get("mean_disease", np.nan),
+                "std_disease": stats_row.get("std_disease", np.nan),
+                "effect_size": stats_row.get("effect_size", np.nan),
+                "deviation_label": comparison["deviation_label"],
+                "z_score": comparison["z_score"],
+                "reference_warning": comparison["reference_warning"],
+                "group": band.get("group", ""),
+                "assignment": band.get("assignment", ""),
+                "reliability": band.get("reliability", ""),
+                "role_label": "кандидатный признак" if str(band.get("peak_role")) == "candidate" else "фоновый признак",
+                "interpretation": band.get("interpretation", ""),
+                "notes": band.get("notes", ""),
+                "brief_meaning": _brief_meaning_from_group(str(band.get("group", ""))),
+                "effect_size_label": effect_size_to_russian(stats_row.get("effect_size", np.nan)),
+                "limitations": _build_band_limitations(band),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def effect_size_to_russian(effect_size: float | int | None) -> str:
+    if effect_size is None or pd.isna(effect_size):
+        return "недостаточно данных"
+    value = abs(float(effect_size))
+    if value < 0.2:
+        return "различие между группами слабое"
+    if value < 0.5:
+        return "малое различие"
+    if value < 0.8:
+        return "умеренное различие"
+    return "выраженное различие"
+
+
+def build_peak_consistency_text(
+    predicted_label: str,
+    candidate_reference_df: pd.DataFrame,
+) -> str:
+    label = str(predicted_label)
+    if candidate_reference_df.empty:
+        candidate_higher = 0
+        candidate_any = 0
+        all_normal = True
+    else:
+        labels = candidate_reference_df["deviation_label"].astype(str)
+        candidate_higher = int(labels.str.contains("выше контрольной группы", na=False).sum())
+        candidate_any = int(len(candidate_reference_df))
+        all_normal = bool(
+            (labels == "в пределах условной спектральной нормы контрольной группы").all()
+        )
+    if label == "Disease":
+        if candidate_higher >= 2:
+            return "Интерпретация спектральных признаков согласуется с прогнозом модели."
+        return (
+            "Модель предсказывает патологический спектральный профиль, однако выраженных кандидатных признаков из текущего справочника не обнаружено. "
+            "Вероятно, решение модели связано с общей формой спектра или признаками вне текущего справочника."
+        )
+    if candidate_higher >= 2:
+        return (
+            "Модель предсказывает профиль нормы, однако часть кандидатных спектральных признаков отклоняется от контрольной группы. "
+            "Результат требует осторожной интерпретации."
+        )
+    if candidate_any == 0 or all_normal:
+        return "Интерпретация спектральных признаков согласуется с прогнозом модели."
+    return "Интерпретация спектральных признаков требует осторожности из-за смешанного характера отклонений."
+
+
 def _select_reference_basis_matrix(dataset: ProcessedDataset, intensity_basis: str) -> tuple[np.ndarray, str]:
     normalized_basis = str(intensity_basis).strip().lower()
     if normalized_basis == "baseline_corrected" and dataset.X_snr is not None:
@@ -240,33 +357,14 @@ def _extract_band_intensity(
     spectroscopy_mode: str,
     aggregation_mode: str = "max",
 ) -> float:
-    mode = normalize_spectroscopy_mode(spectroscopy_mode)
     agg_mode = normalize_aggregation_mode(aggregation_mode)
-    if mode == "sers":
-        if pd.notna(band.get("shift_min_cm")) and pd.notna(band.get("shift_max_cm")):
-            low = float(band["shift_min_cm"])
-            high = float(band["shift_max_cm"])
-        else:
-            shift = float(band["shift_cm"])
-            tolerance = float(band.get("tolerance_cm", 10.0))
-            low = shift - tolerance
-            high = shift + tolerance
-    else:
-        low = float(band["low_cm1"])
-        high = float(band["high_cm1"])
-
+    low, high = _get_band_window(band, spectroscopy_mode)
     mask = (wavenumber >= low) & (wavenumber <= high)
     if not np.any(mask):
         return np.nan
     region_values = np.asarray(spectrum[mask], dtype=float)
     region_wavenumber = np.asarray(wavenumber[mask], dtype=float)
-    if agg_mode == "mean":
-        return float(np.mean(region_values))
-    if agg_mode == "area":
-        if region_values.size < 2:
-            return float(region_values[0])
-        return float(np.trapz(region_values, region_wavenumber))
-    return float(np.max(region_values))
+    return _aggregate_region(region_values, region_wavenumber, agg_mode)
 
 
 def normalize_aggregation_mode(aggregation_mode: str | None) -> str:
@@ -274,6 +372,63 @@ def normalize_aggregation_mode(aggregation_mode: str | None) -> str:
     if normalized not in {"max", "mean", "area"}:
         return "max"
     return normalized
+
+
+def _get_band_window(band: dict[str, Any], spectroscopy_mode: str) -> tuple[float, float]:
+    mode = normalize_spectroscopy_mode(spectroscopy_mode)
+    if mode == "sers":
+        if pd.notna(band.get("shift_min_cm")) and pd.notna(band.get("shift_max_cm")):
+            return float(band["shift_min_cm"]), float(band["shift_max_cm"])
+        shift = float(band["shift_cm"])
+        tolerance = float(band.get("tolerance_cm", 10.0))
+        return shift - tolerance, shift + tolerance
+    return float(band["low_cm1"]), float(band["high_cm1"])
+
+
+def _aggregate_region(region_values: np.ndarray, region_wavenumber: np.ndarray, aggregation_mode: str) -> float:
+    if region_values.size == 0:
+        return np.nan
+    if aggregation_mode == "mean":
+        return float(np.mean(region_values))
+    if aggregation_mode == "area":
+        if region_values.size < 2:
+            return float(region_values[0])
+        return float(np.trapezoid(region_values, region_wavenumber))
+    return float(np.max(region_values))
+
+
+def _format_expected_position(band: dict[str, Any]) -> str:
+    if pd.notna(band.get("shift_min_cm")) and pd.notna(band.get("shift_max_cm")):
+        return f"{float(band['shift_min_cm']):.2f}–{float(band['shift_max_cm']):.2f}"
+    if pd.notna(band.get("shift_cm")):
+        return f"{float(band['shift_cm']):.2f}"
+    return ""
+
+
+def _brief_meaning_from_group(group: str) -> str:
+    lowered = group.lower()
+    if "липид" in lowered:
+        return "липидный признак"
+    if "белково-аминокислот" in lowered:
+        return "белково-аминокислотный признак"
+    if "белков" in lowered:
+        return "белковый признак"
+    if "нуклеинов" in lowered:
+        return "нуклеиновокислотный признак"
+    if "пуринов" in lowered or "фонов" in lowered:
+        return "фоновый пуриновый признак"
+    if "неопредел" in lowered:
+        return "неопределённое отнесение"
+    return "спектральный признак"
+
+
+def _build_band_limitations(band: dict[str, Any]) -> str:
+    note = str(band.get("notes", "")).strip()
+    if note:
+        return note
+    if str(band.get("peak_role", "")) == "background":
+        return "Фоновый признак сыворотки, не является самостоятельным маркером патологии."
+    return "Признак интерпретируется только как часть совокупного спектрального паттерна."
 
 
 def _safe_mean(values: np.ndarray) -> float:

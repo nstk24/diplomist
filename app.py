@@ -36,6 +36,13 @@ from raman_webapp.modeling import (
     predict_patient,
     run_modeling,
 )
+from raman_webapp.patient_report import (
+    build_compact_peak_table,
+    build_detailed_peak_table,
+    build_patient_report_data,
+    build_patient_report_markdown,
+    build_patient_report_pdf,
+)
 from raman_webapp.gemini_analysis import generate_gemini_hypotheses, is_gemini_configured
 from raman_webapp.preprocessing import batch_snr_raman
 from raman_webapp.spectroscopy import (
@@ -47,7 +54,10 @@ from raman_webapp.spectroscopy import (
 )
 from raman_webapp.spectral_references import (
     add_reference_comparison,
+    build_peak_consistency_text,
     compute_reference_peak_statistics,
+    effect_size_to_russian,
+    evaluate_expected_sers_bands,
     normalize_aggregation_mode,
     summarize_reference_comparison,
 )
@@ -68,7 +78,7 @@ from raman_webapp.visuals import (
 ROOT = Path(__file__).resolve().parent
 
 
-st.set_page_config(page_title="Raman Blood Spectra App", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Анализ спектров крови Raman/SERS", page_icon="🧪", layout="wide")
 
 
 def get_available_excel_datasets() -> list[Path]:
@@ -363,6 +373,40 @@ def _band_window_from_library_row(reference_row: pd.Series, spectroscopy_mode: s
     return float(reference_row["low_cm1"]), float(reference_row["high_cm1"])
 
 
+def _expected_peak_short_status(deviation_label: str, status: str) -> str:
+    if status == "не обнаружен":
+        return "не обнаружен"
+    if "Недостаточно данных" in str(deviation_label):
+        return "недостаточно данных"
+    if str(deviation_label) == "в пределах условной спектральной нормы контрольной группы":
+        return "в пределах контрольной группы"
+    if "выше контрольной группы" in str(deviation_label):
+        return "выше контрольной группы"
+    if "ниже контрольной группы" in str(deviation_label):
+        return "ниже контрольной группы"
+    return status
+
+
+def _format_compact_expected_peaks_df(peaks_df: pd.DataFrame) -> pd.DataFrame:
+    return build_compact_peak_table(peaks_df)
+
+
+def _format_detailed_expected_peaks_df(peaks_df: pd.DataFrame) -> pd.DataFrame:
+    return build_detailed_peak_table(peaks_df)
+
+
+def _band_display_value(peaks_df: pd.DataFrame, band_id: str) -> str:
+    band_mask = peaks_df["band_id"].astype(str) == str(band_id)
+    if not band_mask.any():
+        return str(band_id)
+    row = peaks_df.loc[band_mask].iloc[0]
+    for column_name in ("expected_position_cm", "label", "group", "band_id"):
+        value = row.get(column_name)
+        if pd.notna(value) and str(value).strip():
+            return str(value)
+    return str(band_id)
+
+
 def interpretation_block(dataset: ProcessedDataset, snr_summary: dict[str, float | pd.DataFrame], modeling_report) -> str:
     class_means = snr_summary["summary_df"]
     healthy_mean = float(class_means.loc[class_means["group"] == "Healthy", "mean"].iloc[0])
@@ -414,23 +458,36 @@ def external_spectrum_quality_check(
     }
 
 
-st.title("Raman Spectra Classification Workbench")
-st.caption("Local app for preprocessing, exploratory analysis, model comparison and interpretation.")
+st.title("Приложение для анализа Raman/SERS-спектров крови")
+st.caption("Локальное приложение для предобработки, анализа спектров, сравнения моделей и интерпретации признаков.")
 
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Настройки")
     spectroscopy_mode = normalize_spectroscopy_mode(
         st.radio(
-            "Режим спектроскопического анализа",
+            "Режим интерпретации пиков",
             options=["raman", "sers"],
             index=0,
             format_func=get_spectroscopy_mode_label,
-            help="Этот параметр управляет библиотекой ожидаемых пиков, интерпретацией и предупреждениями при анализе спектра пациента.",
+            help="Этот режим определяет справочник пиков и правила интерпретации спектральных признаков. Прогноз модели строится по обучающему датасету и не изменяет свой физический тип автоматически.",
         )
     )
-    dataset_source_mode = st.radio("Training dataset", ["Project Excel file", "Upload Excel file"], index=0)
+    st.caption(
+        "Этот режим определяет справочник пиков и правила интерпретации спектральных признаков. "
+        "Прогноз модели строится по обучающему датасету и не изменяет свой физический тип автоматически."
+    )
+    if spectroscopy_mode == "sers":
+        st.warning(
+            "Для корректного SERS-прогноза модель должна быть обучена на SERS-спектрах, полученных в сопоставимых условиях. "
+            "В текущей версии выбранный режим SERS используется прежде всего для интерпретации пиков."
+        )
+    else:
+        st.info(
+            "Интерпретация Raman-пиков выполняется по справочнику обычной рамановской спектроскопии и зависит от предобработки, качества спектра и состава обучающего датасета."
+        )
+    dataset_source_mode = st.radio("Обучающий датасет", ["Файл проекта Excel", "Загрузить Excel-файл"], index=0)
 
-    if dataset_source_mode == "Project Excel file":
+    if dataset_source_mode == "Файл проекта Excel":
         excel_files = get_available_excel_datasets()
         if not excel_files:
             st.error("No `.xlsx` files were found in the project folder.")
@@ -446,7 +503,7 @@ with st.sidebar:
         dataset, holdout_dataset = get_train_holdout_datasets_from_path(str(selected_path))
         snr_basis_dataset = get_snr_basis_dataset_from_path(str(selected_path))
     else:
-        uploaded_dataset = st.file_uploader("Upload Excel dataset", type=["xlsx"], key="training_dataset_xlsx")
+        uploaded_dataset = st.file_uploader("Загрузите Excel-датасет", type=["xlsx"], key="training_dataset_xlsx")
         if uploaded_dataset is None:
             st.info("Upload an `.xlsx` file to start training on a custom dataset.")
             st.stop()
@@ -471,48 +528,48 @@ wn_max = float(snr_reference_dataset.wavenumber.max())
 wn_step = float(snr_reference_dataset.wavenumber[1] - snr_reference_dataset.wavenumber[0])
 
 with st.sidebar:
-    st.subheader("Modeling Region")
+    st.subheader("Область моделирования")
     modeling_region_mode = st.radio(
-        "Modeling range",
-        ["Auto", "Auto (signal-quality based)", "Manual"],
+        "Рабочий диапазон",
+        ["Авто", "Авто (по качеству сигнала)", "Ручной"],
         index=0,
-        help="This range is used for PCA/t-SNE/UMAP, model training and coefficient interpretation.",
+        help="Этот диапазон используется для PCA/t-SNE/UMAP, обучения моделей и интерпретации коэффициентов.",
     )
     manual_model_window = st.slider(
-        "Modeling window (cm^-1)",
+        "Окно моделирования (см^-1)",
         min_value=wn_min,
         max_value=wn_max,
         value=(signal_quality_region.low, signal_quality_region.high),
         step=wn_step,
-        disabled=modeling_region_mode != "Manual",
+        disabled=modeling_region_mode != "Ручной",
     )
 
-    st.subheader("SNR Windows")
+    st.subheader("Окна SNR")
     signal_window = st.slider(
-        "Signal window (cm^-1)",
+        "Окно сигнала (см^-1)",
         min_value=wn_min,
         max_value=wn_max,
         value=(max(wn_min, 400.0), min(wn_max, 1700.0)),
         step=wn_step,
     )
     noise_window = st.slider(
-        "Noise window (cm^-1)",
+        "Окно шума (см^-1)",
         min_value=wn_min,
         max_value=wn_max,
         value=(max(wn_min, 1800.0), min(wn_max, 1950.0)),
         step=wn_step,
     )
-    snr_k = st.number_input("SNR divisor k", min_value=0.1, max_value=20.0, value=6.0, step=0.1)
+    snr_k = st.number_input("Делитель SNR k", min_value=0.1, max_value=20.0, value=6.0, step=0.1)
 
-if modeling_region_mode == "Manual":
+if modeling_region_mode == "Ручной":
     modeling_low, modeling_high = manual_model_window
-    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} cm^-1 (manual)"
-elif modeling_region_mode == "Auto (signal-quality based)":
+    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} см^-1 (ручной режим)"
+elif modeling_region_mode == "Авто (по качеству сигнала)":
     modeling_low, modeling_high = signal_quality_region.low, signal_quality_region.high
-    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} cm^-1 (auto: signal quality)"
+    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} см^-1 (авто: качество сигнала)"
 else:
     modeling_low, modeling_high = informative_region.low, informative_region.high
-    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} cm^-1 (auto: curated)"
+    modeling_region_label = f"{modeling_low:.1f}-{modeling_high:.1f} см^-1 (авто: справочник зон)"
 
 model_dataset = dataset.select_wavenumber_range(modeling_low, modeling_high)
 
@@ -527,7 +584,7 @@ custom_snr_values = get_custom_snr_values(
 snr_summary = snr_statistics_from_values(dataset.y, custom_snr_values)
 
 tab_overview, tab_snr, tab_proj, tab_models, tab_interpret, tab_patient_prediction = st.tabs(
-    ["Overview", "SNR", "Projections", "Models", "Interpretation", "Patient Prediction"]
+    ["Обзор", "SNR", "Проекции", "Модели", "Интерпретация", "Прогноз пациента"]
 )
 
 with tab_overview:
@@ -582,13 +639,13 @@ with tab_overview:
     st.plotly_chart(fig_var, use_container_width=True)
 
     st.write(
-        "The preprocessing layer uses ALS baseline correction followed by SNV normalization. "
-        "All downstream analysis in the app uses the normalized working dataset."
+        "Слой предобработки использует ALS baseline correction, после чего применяется SNV-нормализация. "
+        "Вся дальнейшая аналитика в приложении работает с нормализованным рабочим датасетом."
     )
-    if modeling_region_mode == "Auto":
+    if modeling_region_mode == "Авто":
         st.info(
-            f"Automatic modeling window: {modeling_region_label}. "
-            "In the current version it is anchored to the curated CVD-associated Raman zones from the local reference library."
+            f"Автоматическое окно моделирования: {modeling_region_label}. "
+            "В текущей версии оно опирается на локальный справочник CVD-ассоциированных Raman-зон."
         )
         st.plotly_chart(
             informative_region_figure(
@@ -600,10 +657,10 @@ with tab_overview:
             ),
             use_container_width=True,
         )
-    elif modeling_region_mode == "Auto (signal-quality based)":
+    elif modeling_region_mode == "Авто (по качеству сигнала)":
         st.info(
-            f"Automatic modeling window: {modeling_region_label}. "
-            "This mode uses baseline-corrected signal strength, local noise floor and cross-sample presence to keep the widest continuous signal-supported spectral window while suppressing low-information regions before modeling."
+            f"Автоматическое окно по качеству сигнала: {modeling_region_label}. "
+            "Этот режим использует baseline-corrected интенсивность, локальный шумовой фон и присутствие сигнала в нескольких спектрах, чтобы сохранить максимально широкую информативную область."
         )
         st.plotly_chart(
             informative_region_figure(
@@ -616,7 +673,7 @@ with tab_overview:
             use_container_width=True,
         )
     else:
-        st.info(f"Manual modeling window: {modeling_region_label}.")
+        st.info(f"Ручное окно моделирования: {modeling_region_label}.")
 
 with tab_snr:
     st.write(
@@ -830,13 +887,14 @@ with tab_patient_prediction:
             prediction = predict_patient(modeling_report, external_model_vector)
             st.subheader("Результат прогноза")
             pred_cols = st.columns(4)
-            pred_cols[0].metric("Режим анализа", get_spectroscopy_mode_label(spectroscopy_mode))
-            pred_cols[1].metric("Предсказанный класс", _prediction_label_to_russian(str(prediction["predicted_label"])))
+            prediction_label_ru = _prediction_label_to_russian(str(prediction["predicted_label"]))
+            pred_cols[0].metric("Режим интерпретации пиков", get_spectroscopy_mode_label(spectroscopy_mode))
+            pred_cols[1].metric("Предсказанный спектральный профиль", prediction_label_ru)
             pred_cols[2].metric(
                 "Вероятность патологического спектрального профиля",
                 f"{prediction['probability_disease']:.3f}",
             )
-            pred_cols[3].metric("Вероятность нормы", f"{prediction['probability_healthy']:.3f}")
+            pred_cols[3].metric("Вероятность спектрального профиля нормы", f"{prediction['probability_healthy']:.3f}")
             st.warning(
                 "Результат не является медицинским диагнозом. Прогноз основан на сходстве спектра с группами обучающего датасета."
             )
@@ -1055,7 +1113,7 @@ with tab_patient_prediction:
                             )
                             st.dataframe(summary_display_df, use_container_width=True)
 
-                        reference_comparison_df = add_reference_comparison(
+                        candidate_reference_df = add_reference_comparison(
                             peak_analysis_result.matched_peaks_df,
                             reference_stats_df,
                             patient_intensity_col="intensity",
@@ -1066,36 +1124,30 @@ with tab_patient_prediction:
                             spectroscopy_mode=spectroscopy_mode,
                             aggregation_mode=reference_aggregation_mode,
                         )
-                        if reference_comparison_df.empty:
+                        background_reference_df = pd.DataFrame()
+                        if candidate_reference_df.empty:
                             st.info(
                                 "Ни один из найденных пиков не попал в текущую библиотеку характерных полос. Это не исключает наличие изменений, а только отсутствие совпадений со справочником."
                             )
                         else:
+                            st.subheader("Краткая интерпретация спектральных признаков")
+                            st.dataframe(_format_compact_expected_peaks_df(candidate_reference_df), use_container_width=True)
                             st.subheader("Сравнение с контрольной группой")
                             st.caption(
                                 f"Основа сравнения: {peak_y_axis_title.lower()}. Метрика зоны: {_aggregation_mode_to_russian(reference_aggregation_mode)}."
                             )
-                            st.dataframe(
-                                _format_reference_comparison_df(reference_comparison_df, spectroscopy_mode),
-                                use_container_width=True,
-                            )
-                            higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(reference_comparison_df)
+                            higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(candidate_reference_df)
                             st.info(
                                 "По сравнению с контрольной группой здоровых доноров "
-                                f"{higher_count} признаков имеют интенсивность выше условной спектральной нормы, "
+                                f"{higher_count} найденных признаков имеют интенсивность выше условной спектральной нормы, "
                                 f"{lower_count} признаков ниже контрольной группы, "
                                 f"{normal_count} признаков находятся в пределах контрольного диапазона. "
                                 f"Для {unknown_count} признаков недостаточно данных для расчёта отклонения."
                             )
                             selected_band_id = st.selectbox(
                                 "Зона для локального референсного графика",
-                                reference_comparison_df["band_id"].astype(str).tolist(),
-                                format_func=lambda band_id: str(
-                                    reference_comparison_df.loc[
-                                        reference_comparison_df["band_id"].astype(str) == str(band_id),
-                                        "expected_position_cm",
-                                    ].iloc[0]
-                                ),
+                                candidate_reference_df["band_id"].astype(str).tolist(),
+                                format_func=lambda band_id: _band_display_value(candidate_reference_df, str(band_id)),
                                 key="raman_reference_band_plot",
                             )
                             reference_row = reference_band_library.loc[
@@ -1122,17 +1174,22 @@ with tab_patient_prediction:
                                 use_container_width=True,
                             )
                     else:
-                        st.caption(f"Выбран режим: {get_spectroscopy_mode_label(spectroscopy_mode)}.")
-                        if peak_analysis_result.summary_df.empty:
-                            st.info("Кандидатные или фоновые SERS-признаки в текущем спектре не выделены.")
-                        else:
-                            st.dataframe(_format_sers_summary_df(peak_analysis_result.summary_df), use_container_width=True)
+                        st.caption(f"Выбран режим интерпретации пиков: {get_spectroscopy_mode_label(spectroscopy_mode)}.")
+                        expected_sers_df = evaluate_expected_sers_bands(
+                            patient_wavenumber=peak_plot_wavenumber,
+                            patient_intensity=peak_plot_intensity,
+                            reference_library_df=reference_band_library,
+                            reference_stats_df=reference_stats_df,
+                            aggregation_mode=reference_aggregation_mode,
+                        )
+                        candidate_reference_df = expected_sers_df.loc[expected_sers_df["peak_role"] == "candidate"].copy()
+                        background_reference_df = expected_sers_df.loc[expected_sers_df["peak_role"] == "background"].copy()
 
                         sers_metrics = st.columns(4)
-                        sers_metrics[0].metric("Кандидатные признаки патологии", peak_analysis_result.candidate_peak_count)
-                        sers_metrics[1].metric("Фоновые признаки сыворотки", peak_analysis_result.background_peak_count)
+                        sers_metrics[0].metric("Кандидатные признаки патологии", int(len(candidate_reference_df)))
+                        sers_metrics[1].metric("Фоновые признаки сыворотки", int(len(background_reference_df)))
                         sers_metrics[2].metric(
-                            "Оценка SERS-CVD",
+                            "Оценка SERS-паттерна",
                             f"{peak_analysis_result.sers_cvd_score:.2f}" if peak_analysis_result.sers_cvd_score is not None else "0.00",
                         )
                         sers_metrics[3].metric(
@@ -1140,99 +1197,91 @@ with tab_patient_prediction:
                             peak_analysis_result.sers_cvd_pattern_level or "не определён",
                         )
 
-                        candidate_reference_df = add_reference_comparison(
-                            peak_analysis_result.detected_candidate_peaks_df,
-                            reference_stats_df,
-                            patient_intensity_col="intensity",
-                            allow_reference_comparison=True,
-                            patient_wavenumber=peak_plot_wavenumber,
-                            patient_intensity=peak_plot_intensity,
-                            reference_library_df=reference_band_library,
-                            spectroscopy_mode=spectroscopy_mode,
-                            aggregation_mode=reference_aggregation_mode,
+                        st.subheader("Ожидаемые спектральные признаки")
+                        st.dataframe(_format_compact_expected_peaks_df(expected_sers_df), use_container_width=True)
+
+                        st.subheader("Краткая интерпретация спектральных признаков")
+                        st.dataframe(_format_compact_expected_peaks_df(candidate_reference_df), use_container_width=True)
+                        if not background_reference_df.empty:
+                            st.subheader("Фоновые признаки сыворотки")
+                            st.dataframe(_format_compact_expected_peaks_df(background_reference_df), use_container_width=True)
+
+                        st.subheader("Сравнение с контрольной группой")
+                        st.caption(
+                            f"Основа сравнения: {peak_y_axis_title.lower()}. Метрика зоны: {_aggregation_mode_to_russian(reference_aggregation_mode)}."
                         )
-                        background_reference_df = add_reference_comparison(
-                            peak_analysis_result.detected_background_peaks_df,
-                            reference_stats_df,
-                            patient_intensity_col="intensity",
-                            allow_reference_comparison=True,
-                            patient_wavenumber=peak_plot_wavenumber,
-                            patient_intensity=peak_plot_intensity,
-                            reference_library_df=reference_band_library,
-                            spectroscopy_mode=spectroscopy_mode,
-                            aggregation_mode=reference_aggregation_mode,
+                        higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(candidate_reference_df)
+                        st.info(
+                            "По сравнению с контрольной группой здоровых доноров "
+                            f"{higher_count} найденных признаков имеют интенсивность выше условной спектральной нормы, "
+                            f"{lower_count} признаков ниже контрольной группы, "
+                            f"{normal_count} признаков находятся в пределах контрольного диапазона. "
+                            f"Для {unknown_count} признаков недостаточно данных для расчёта отклонения."
+                        )
+                        st.caption(summarize_reference_comparison(candidate_reference_df, background_reference_df, spectroscopy_mode))
+
+                        selected_band_id = st.selectbox(
+                            "Зона для локального референсного графика",
+                            expected_sers_df["band_id"].astype(str).tolist(),
+                            format_func=lambda band_id: _band_display_value(expected_sers_df, str(band_id)),
+                            key="sers_reference_band_plot",
+                        )
+                        reference_row = reference_band_library.loc[
+                            reference_band_library["band_id"].astype(str) == str(selected_band_id)
+                        ].iloc[0]
+                        band_low, band_high = _band_window_from_library_row(reference_row, spectroscopy_mode)
+                        plot_padding = 15.0
+                        plot_mask = (peak_plot_wavenumber >= band_low - plot_padding) & (peak_plot_wavenumber <= band_high + plot_padding)
+                        reference_X = dataset.X_snr if reference_intensity_basis == "baseline_corrected" and dataset.X_snr is not None else dataset.X
+                        healthy_profile = reference_X[dataset.y == 0].mean(axis=0)
+                        disease_profile = reference_X[dataset.y == 1].mean(axis=0) if np.any(dataset.y == 1) else np.full_like(healthy_profile, np.nan)
+                        st.plotly_chart(
+                            spectrum_line_figure(
+                                peak_plot_wavenumber[plot_mask],
+                                [
+                                    healthy_profile[plot_mask],
+                                    disease_profile[plot_mask],
+                                    peak_plot_intensity[plot_mask],
+                                ],
+                                ["Средний профиль нормы", "Средний патологический профиль", "Спектр пациента"],
+                                f"Локальное сравнение в зоне {band_low:.2f}-{band_high:.2f} см⁻¹",
+                                peak_y_axis_title,
+                            ),
+                            use_container_width=True,
                         )
 
-                        st.subheader("Кандидатные признаки патологии")
-                        if candidate_reference_df.empty:
-                            st.info("Кандидатные SERS-пики не найдены.")
-                        else:
-                            st.dataframe(
-                                _format_reference_comparison_df(candidate_reference_df, spectroscopy_mode),
-                                use_container_width=True,
-                            )
+                    consistency_text = build_peak_consistency_text(str(prediction["predicted_label"]), candidate_reference_df)
+                    st.subheader("Согласованность прогноза и спектральных признаков")
+                    st.info(consistency_text)
 
-                        st.subheader("Фоновые признаки сыворотки")
-                        if background_reference_df.empty:
-                            st.info("Фоновые SERS-пики сыворотки не найдены.")
+                    with st.expander("Показать подробную таблицу для отчёта", expanded=False):
+                        detailed_df = pd.concat([candidate_reference_df, background_reference_df], ignore_index=True) if not candidate_reference_df.empty or not background_reference_df.empty else pd.DataFrame()
+                        st.subheader("Подробная интерпретация спектральных признаков")
+                        if detailed_df.empty:
+                            st.info("Подробные данные для отчёта пока отсутствуют.")
                         else:
-                            st.dataframe(
-                                _format_reference_comparison_df(background_reference_df, spectroscopy_mode),
-                                use_container_width=True,
-                            )
+                            st.dataframe(_format_detailed_expected_peaks_df(detailed_df), use_container_width=True)
 
-                        combined_reference_df = pd.concat(
-                            [candidate_reference_df, background_reference_df],
-                            ignore_index=True,
-                        ) if not candidate_reference_df.empty or not background_reference_df.empty else pd.DataFrame()
-                        if not combined_reference_df.empty:
-                            st.subheader("Сравнение с контрольной группой")
-                            st.caption(
-                                f"Основа сравнения: {peak_y_axis_title.lower()}. Метрика зоны: {_aggregation_mode_to_russian(reference_aggregation_mode)}."
-                            )
-                            higher_count, lower_count, normal_count, unknown_count = _reference_deviation_counts(combined_reference_df)
-                            st.info(
-                                "По сравнению с контрольной группой здоровых доноров "
-                                f"{higher_count} найденных признаков имеют интенсивность выше условной спектральной нормы, "
-                                f"{lower_count} признаков ниже контрольной группы, "
-                                f"{normal_count} признаков находятся в пределах контрольного диапазона. "
-                                f"Для {unknown_count} признаков недостаточно данных для расчёта отклонения."
-                            )
-                            st.caption(summarize_reference_comparison(candidate_reference_df, background_reference_df, spectroscopy_mode))
-                            selected_band_id = st.selectbox(
-                                "Зона для локального референсного графика",
-                                combined_reference_df["band_id"].astype(str).tolist(),
-                                format_func=lambda band_id: str(
-                                    combined_reference_df.loc[
-                                        combined_reference_df["band_id"].astype(str) == str(band_id),
-                                        "expected_position_cm",
-                                    ].iloc[0]
-                                ),
-                                key="sers_reference_band_plot",
-                            )
-                            reference_row = reference_band_library.loc[
-                                reference_band_library["band_id"].astype(str) == str(selected_band_id)
-                            ].iloc[0]
-                            band_low, band_high = _band_window_from_library_row(reference_row, spectroscopy_mode)
-                            plot_padding = 15.0
-                            plot_mask = (peak_plot_wavenumber >= band_low - plot_padding) & (peak_plot_wavenumber <= band_high + plot_padding)
-                            reference_X = dataset.X_snr if reference_intensity_basis == "baseline_corrected" and dataset.X_snr is not None else dataset.X
-                            healthy_profile = reference_X[dataset.y == 0].mean(axis=0)
-                            disease_profile = reference_X[dataset.y == 1].mean(axis=0) if np.any(dataset.y == 1) else np.full_like(healthy_profile, np.nan)
-                            st.plotly_chart(
-                                spectrum_line_figure(
-                                    peak_plot_wavenumber[plot_mask],
-                                    [
-                                        healthy_profile[plot_mask],
-                                        disease_profile[plot_mask],
-                                        peak_plot_intensity[plot_mask],
-                                    ],
-                                    ["Средний профиль нормы", "Средний патологический профиль", "Спектр пациента"],
-                                    f"Локальное сравнение в зоне {band_low:.2f}-{band_high:.2f} см⁻¹",
-                                    peak_y_axis_title,
-                                ),
-                                use_container_width=True,
-                            )
+                    report_prediction = dict(prediction)
+                    report_prediction["predicted_label_ru"] = prediction_label_ru
+                    report_data = build_patient_report_data(
+                        spectroscopy_mode=spectroscopy_mode,
+                        prediction=report_prediction,
+                        candidate_df=candidate_reference_df,
+                        background_df=background_reference_df,
+                        consistency_text=consistency_text,
+                    )
+                    report_markdown = build_patient_report_markdown(report_data)
+                    report_pdf = build_patient_report_pdf(report_data)
+                    st.download_button(
+                        "Скачать отчёт в PDF",
+                        data=report_pdf,
+                        file_name="patient_report.pdf",
+                        mime="application/pdf",
+                        key="download_patient_report_pdf",
+                    )
+                    with st.expander("Предпросмотр текста отчёта", expanded=False):
+                        st.markdown(report_markdown)
 
                 st.subheader("Gemini: гипотезы по спектральным областям")
                 gemini_ready, gemini_status = is_gemini_configured()

@@ -5,11 +5,13 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from raman_webapp.analysis import detect_spectral_peaks
 from raman_webapp.data import ProcessedDataset, load_reference_band_library
 from raman_webapp.spectral_references import (
     add_reference_comparison,
     compare_peak_to_reference,
     compute_reference_peak_statistics,
+    evaluate_expected_sers_bands,
     extract_expected_peak_intensities,
 )
 from raman_webapp.spectroscopy import analyze_spectroscopy_peaks
@@ -171,6 +173,59 @@ class SpectralReferencesTest(unittest.TestCase):
         )
         self.assertEqual(result.candidate_peak_count, 0)
         self.assertEqual(result.background_peak_count, 3)
+
+    def test_expected_sers_zones_do_not_depend_on_top_k(self) -> None:
+        wavenumber = np.arange(500.0, 1701.0, 1.0)
+        intensity = np.zeros_like(wavenumber)
+        high_noise_centers = list(np.arange(510.0, 610.0, 10.0))
+        for idx, center in enumerate(high_noise_centers):
+            intensity += _gaussian(wavenumber, center, amplitude=2.0 - idx * 0.05, sigma=1.5)
+        intensity += _gaussian(wavenumber, 1481.0, amplitude=0.7, sigma=2.0)
+
+        peaks_df = detect_spectral_peaks(
+            wavenumber,
+            intensity,
+            prominence=0.05,
+            min_distance_cm=6.0,
+            min_width_cm=2.0,
+            top_k=3,
+        ).peaks_df
+        self.assertNotIn(1481.0, peaks_df["wavenumber_cm-1"].round(0).tolist())
+
+        spectra = np.vstack(
+            [
+                _gaussian(wavenumber, 1481.0, amplitude=0.5, sigma=2.0),
+                _gaussian(wavenumber, 1481.0, amplitude=0.6, sigma=2.0),
+                _gaussian(wavenumber, 1481.0, amplitude=0.8, sigma=2.0),
+                _gaussian(wavenumber, 1481.0, amplitude=0.9, sigma=2.0),
+            ]
+        )
+        dataset = ProcessedDataset(
+            X=spectra.copy(),
+            y=np.array([0, 0, 1, 1], dtype=int),
+            wavenumber=wavenumber,
+            snr=np.ones(4, dtype=float),
+            X_snr=spectra.copy(),
+            sample_names=np.array(["h1", "h2", "d1", "d2"], dtype=object),
+        )
+        reference_library_df = load_reference_band_library(spectroscopy_mode="sers")
+        stats_df = compute_reference_peak_statistics(
+            dataset=dataset,
+            reference_library_df=reference_library_df,
+            spectroscopy_mode="sers",
+            intensity_basis="baseline_corrected",
+        )
+        expected_df = evaluate_expected_sers_bands(
+            patient_wavenumber=wavenumber,
+            patient_intensity=intensity,
+            reference_library_df=reference_library_df,
+            reference_stats_df=stats_df,
+            aggregation_mode="max",
+        )
+        target_row = expected_df.loc[expected_df["band_id"] == "sers_1481"].iloc[0]
+        self.assertEqual(str(target_row["peak_role"]), "candidate")
+        self.assertEqual(str(target_row["status"]), "обнаружен")
+        self.assertAlmostEqual(float(target_row["measured_shift_cm"]), 1481.0, delta=2.0)
 
     def test_missing_healthy_group_returns_warning_without_crash(self) -> None:
         wavenumber = np.arange(500.0, 1701.0, 1.0)
