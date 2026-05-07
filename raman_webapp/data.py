@@ -10,7 +10,10 @@ from typing import BinaryIO
 import numpy as np
 import pandas as pd
 
-from .preprocessing import als_baseline, snr_raman, snv
+from .preprocessing import als_baseline, batch_smooth_savgol, smooth_savgol, snr_raman, snv
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -28,6 +31,8 @@ class ProcessedDataset:
     y: np.ndarray
     wavenumber: np.ndarray
     snr: np.ndarray
+    X_raw: np.ndarray | None = None
+    X_smoothed: np.ndarray | None = None
     X_snr: np.ndarray | None = None
     sample_names: np.ndarray | None = None
 
@@ -42,6 +47,8 @@ class ProcessedDataset:
             y=self.y.copy(),
             wavenumber=self.wavenumber[mask].copy(),
             snr=self.snr.copy(),
+            X_raw=self.X_raw[:, mask].copy() if self.X_raw is not None else None,
+            X_smoothed=self.X_smoothed[:, mask].copy() if self.X_smoothed is not None else None,
             X_snr=self.X_snr[:, mask].copy() if self.X_snr is not None else None,
             sample_names=self.sample_names.copy() if self.sample_names is not None else None,
         )
@@ -53,6 +60,8 @@ class ProcessedDataset:
             y=self.y[mask].copy(),
             wavenumber=self.wavenumber.copy(),
             snr=self.snr[mask].copy(),
+            X_raw=self.X_raw[mask].copy() if self.X_raw is not None else None,
+            X_smoothed=self.X_smoothed[mask].copy() if self.X_smoothed is not None else None,
             X_snr=self.X_snr[mask].copy() if self.X_snr is not None else None,
             sample_names=self.sample_names[mask].copy() if self.sample_names is not None else None,
         )
@@ -63,6 +72,7 @@ class ExternalSpectrum:
     source_wavenumber: np.ndarray
     source_intensity: np.ndarray
     aligned_intensity: np.ndarray
+    smoothed_intensity: np.ndarray
     baseline_corrected: np.ndarray
     snv_processed: np.ndarray
     parser_mode: str
@@ -117,9 +127,10 @@ def preprocess_raw_dataset(
     )
     sample_names = np.concatenate([raw.health_names, raw.disease_names])
 
+    X_smoothed = batch_smooth_savgol(X)
     X_bc = np.empty_like(X, dtype=float)
-    for idx in range(X.shape[0]):
-        X_bc[idx] = X[idx] - als_baseline(X[idx], lam=lam, p=p, niter=niter)
+    for idx in range(X_smoothed.shape[0]):
+        X_bc[idx] = X_smoothed[idx] - als_baseline(X_smoothed[idx], lam=lam, p=p, niter=niter)
 
     X_snv = snv(X_bc)
     snr = np.array([snr_raman(row, raw.wavenumber) for row in X_bc], dtype=float)
@@ -129,6 +140,8 @@ def preprocess_raw_dataset(
         y=y,
         wavenumber=raw.wavenumber.copy(),
         snr=snr,
+        X_raw=X.copy(),
+        X_smoothed=X_smoothed.copy(),
         X_snr=X_bc,
         sample_names=sample_names.copy(),
     )
@@ -145,7 +158,16 @@ def load_processed_csvs(
     wavenumber = _read_numeric_csv_vector(wavenumber_path, dtype=float)
     snr = _read_numeric_csv_vector(snr_path, dtype=float)
     sample_names = _default_sample_names_from_labels(y)
-    return ProcessedDataset(X=X, y=y, wavenumber=wavenumber, snr=snr, X_snr=None, sample_names=sample_names)
+    return ProcessedDataset(
+        X=X,
+        y=y,
+        wavenumber=wavenumber,
+        snr=snr,
+        X_raw=None,
+        X_smoothed=None,
+        X_snr=None,
+        sample_names=sample_names,
+    )
 
 
 def _read_numeric_csv_matrix(path: str | Path) -> np.ndarray:
@@ -181,7 +203,7 @@ def split_train_holdout(dataset: ProcessedDataset) -> tuple[ProcessedDataset, Pr
     if dataset.sample_names is None:
         raise ValueError("Dataset sample names are required for holdout splitting.")
 
-    normalized_holdout_names = {_normalize_sample_name(name) for name in HOLDOUT_SAMPLE_NAMES}
+    normalized_holdout_names = _load_holdout_sample_names()
     normalized_sample_names = np.array([_normalize_sample_name(name) for name in dataset.sample_names], dtype=str)
 
     holdout_mask = np.isin(normalized_sample_names, list(normalized_holdout_names))
@@ -270,13 +292,15 @@ def load_external_spectrum_csv(file_obj, reference_wavenumber: np.ndarray) -> Ex
     unique_intensity = source_intensity[unique_idx]
 
     aligned_intensity = np.interp(reference_wavenumber, unique_wavenumber, unique_intensity)
-    baseline_corrected = aligned_intensity - als_baseline(aligned_intensity)
+    smoothed_intensity = smooth_savgol(aligned_intensity)
+    baseline_corrected = smoothed_intensity - als_baseline(smoothed_intensity)
     snv_processed = snv(baseline_corrected[None, :])[0]
 
     return ExternalSpectrum(
         source_wavenumber=unique_wavenumber,
         source_intensity=unique_intensity,
         aligned_intensity=aligned_intensity,
+        smoothed_intensity=smoothed_intensity,
         baseline_corrected=baseline_corrected,
         snv_processed=snv_processed,
         parser_mode=parser_mode,
@@ -302,3 +326,15 @@ def _normalize_sample_name(name: str) -> str:
     normalized = normalized.replace("-", "_").replace(" ", "_")
     normalized = re.sub(r"_+", "_", normalized)
     return normalized
+
+
+def _load_holdout_sample_names() -> set[str]:
+    manifest_path = ROOT / "patient_csv_exports" / "manifest.csv"
+    if manifest_path.exists():
+        manifest_df = pd.read_csv(manifest_path)
+        if "patient_name" in manifest_df.columns:
+            patient_names = manifest_df["patient_name"].dropna().astype(str).tolist()
+            normalized = {_normalize_sample_name(name) for name in patient_names}
+            if normalized:
+                return normalized
+    return {_normalize_sample_name(name) for name in HOLDOUT_SAMPLE_NAMES}

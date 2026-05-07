@@ -66,6 +66,7 @@ def spectrum_with_band_figure(
     label_a: str,
     label_b: str,
     title: str,
+    y_axis_title: str = "Intensity",
 ) -> go.Figure:
     fig = go.Figure()
     for mean, sem, label, color in [
@@ -84,7 +85,7 @@ def spectrum_with_band_figure(
                 hoverinfo="skip",
             )
         )
-    fig.update_layout(title=title, xaxis_title="Wavenumber, cm^-1", yaxis_title="Intensity")
+    fig.update_layout(title=title, xaxis_title="Wavenumber, cm^-1", yaxis_title=y_axis_title)
     return fig
 
 

@@ -30,6 +30,8 @@ SCORING = {
 @dataclass
 class ModelingReport:
     screening_df: pd.DataFrame
+    inner_score_df: pd.DataFrame
+    final_model_ranking_df: pd.DataFrame
     nested_fold_df: pd.DataFrame
     nested_summary_df: pd.DataFrame
     best_model_metrics_df: pd.DataFrame
@@ -89,9 +91,10 @@ def _get_score_values(fitted_pipe: Pipeline, X: np.ndarray) -> np.ndarray:
 def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
     outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     inner_cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
+    pipelines = build_pipelines()
 
     screening_rows: list[dict[str, float | str]] = []
-    for name, pipe in build_pipelines().items():
+    for name, pipe in pipelines.items():
         scores = cross_validate(pipe, dataset.X, dataset.y, cv=outer_cv, scoring=SCORING)
         screening_rows.append(
             {
@@ -106,17 +109,26 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
     screening_df = pd.DataFrame(screening_rows).sort_values("roc_auc_mean", ascending=False).reset_index(drop=True)
 
     nested_rows: list[dict[str, float | str | int]] = []
+    inner_score_rows: list[dict[str, float | str | int]] = []
     for fold_id, (train_idx, test_idx) in enumerate(outer_cv.split(dataset.X, dataset.y), start=1):
         X_train, X_test = dataset.X[train_idx], dataset.X[test_idx]
         y_train, y_test = dataset.y[train_idx], dataset.y[test_idx]
 
         inner_summary: dict[str, float] = {}
-        for name, pipe in build_pipelines().items():
+        for name, pipe in pipelines.items():
             inner_scores = cross_validate(pipe, X_train, y_train, cv=inner_cv, scoring=SCORING)
-            inner_summary[name] = inner_scores["test_roc_auc"].mean()
+            mean_inner_roc_auc = float(inner_scores["test_roc_auc"].mean())
+            inner_summary[name] = mean_inner_roc_auc
+            inner_score_rows.append(
+                {
+                    "fold": fold_id,
+                    "model": name,
+                    "inner_roc_auc_mean": mean_inner_roc_auc,
+                }
+            )
 
         best_name = max(inner_summary, key=inner_summary.get)
-        best_pipe = clone(build_pipelines()[best_name])
+        best_pipe = clone(pipelines[best_name])
         best_pipe.fit(X_train, y_train)
 
         y_score = _get_score_values(best_pipe, X_test)
@@ -135,7 +147,18 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
 
     nested_fold_df = pd.DataFrame(nested_rows)
     selected_model_counts = nested_fold_df["selected_model"].value_counts()
-    final_selected_model_name = str(selected_model_counts.idxmax())
+    inner_score_df = pd.DataFrame(inner_score_rows)
+    inner_summary_df = (
+        inner_score_df.groupby("model", as_index=False)["inner_roc_auc_mean"].mean().rename(
+            columns={"inner_roc_auc_mean": "mean_inner_roc_auc"}
+        )
+    )
+    final_model_ranking_df = inner_summary_df.merge(
+        screening_df[["model", "roc_auc_mean"]],
+        on="model",
+        how="left",
+    ).sort_values(["mean_inner_roc_auc", "roc_auc_mean"], ascending=False)
+    final_selected_model_name = str(final_model_ranking_df.iloc[0]["model"])
 
     nested_summary_df = pd.DataFrame(
         [
@@ -148,25 +171,30 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
         ]
     )
 
-    best_screening_row = screening_df.iloc[0]
-    best_screening_model_name = str(best_screening_row["model"])
+    final_selected_row = screening_df.loc[
+        screening_df["model"].astype(str) == final_selected_model_name
+    ].iloc[0]
     best_model_metrics_df = pd.DataFrame(
         [
-            {"metric": "roc_auc", "value": float(best_screening_row["roc_auc_mean"]), "std": float(best_screening_row["roc_auc_std"])},
-            {"metric": "accuracy", "value": float(best_screening_row["accuracy_mean"]), "std": np.nan},
-            {"metric": "f1", "value": float(best_screening_row["f1_mean"]), "std": np.nan},
+            {
+                "metric": "roc_auc",
+                "value": float(final_selected_row["roc_auc_mean"]),
+                "std": float(final_selected_row["roc_auc_std"]),
+            },
+            {"metric": "accuracy", "value": float(final_selected_row["accuracy_mean"]), "std": np.nan},
+            {"metric": "f1", "value": float(final_selected_row["f1_mean"]), "std": np.nan},
             {
                 "metric": "balanced_accuracy",
-                "value": float(best_screening_row["balanced_accuracy_mean"]),
+                "value": float(final_selected_row["balanced_accuracy_mean"]),
                 "std": np.nan,
             },
         ]
     )
 
-    best_screening_pipe = build_pipelines()[best_screening_model_name]
+    final_selected_pipe = pipelines[final_selected_model_name]
     oof_scores = np.zeros(dataset.y.shape[0], dtype=float)
     for train_idx, test_idx in outer_cv.split(dataset.X, dataset.y):
-        fold_pipe = clone(best_screening_pipe)
+        fold_pipe = clone(final_selected_pipe)
         fold_pipe.fit(dataset.X[train_idx], dataset.y[train_idx])
         oof_scores[test_idx] = _get_score_values(fold_pipe, dataset.X[test_idx])
     fpr, tpr, thresholds = roc_curve(dataset.y, oof_scores)
@@ -178,7 +206,7 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
         }
     )
 
-    deployment_model = clone(build_pipelines()[final_selected_model_name])
+    deployment_model = clone(pipelines[final_selected_model_name])
     deployment_model.fit(dataset.X, dataset.y)
 
     interpretation_model = Pipeline(
@@ -202,6 +230,8 @@ def run_modeling(dataset: ProcessedDataset) -> ModelingReport:
 
     return ModelingReport(
         screening_df=screening_df,
+        inner_score_df=inner_score_df,
+        final_model_ranking_df=final_model_ranking_df,
         nested_fold_df=nested_fold_df,
         nested_summary_df=nested_summary_df,
         best_model_metrics_df=best_model_metrics_df,

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 from scipy import sparse
+from scipy.signal import savgol_filter
 from scipy.sparse.linalg import spsolve
+
+
+DEFAULT_SAVGOL_WINDOW = 11
+DEFAULT_SAVGOL_POLYORDER = 3
 
 
 def als_baseline(y: np.ndarray, lam: float = 1e6, p: float = 0.01, niter: int = 10) -> np.ndarray:
@@ -22,6 +27,43 @@ def snv(X: np.ndarray) -> np.ndarray:
     mean = X.mean(axis=1, keepdims=True)
     std = X.std(axis=1, keepdims=True)
     return (X - mean) / (std + 1e-12)
+
+
+def smooth_savgol(
+    x: np.ndarray,
+    window_length: int = DEFAULT_SAVGOL_WINDOW,
+    polyorder: int = DEFAULT_SAVGOL_POLYORDER,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Savitzky-Golay smoothing expects a one-dimensional spectrum.")
+    if x.size < 5:
+        return x.copy()
+
+    max_window = x.size if x.size % 2 == 1 else x.size - 1
+    window = min(int(window_length), max_window)
+    if window < 5:
+        return x.copy()
+    if window % 2 == 0:
+        window -= 1
+    if window <= polyorder:
+        return x.copy()
+
+    return savgol_filter(x, window_length=window, polyorder=polyorder)
+
+
+def batch_smooth_savgol(
+    X: np.ndarray,
+    window_length: int = DEFAULT_SAVGOL_WINDOW,
+    polyorder: int = DEFAULT_SAVGOL_POLYORDER,
+) -> np.ndarray:
+    X = np.asarray(X, dtype=float)
+    return np.vstack(
+        [
+            smooth_savgol(row, window_length=window_length, polyorder=polyorder)
+            for row in X
+        ]
+    )
 
 
 def snr_raman(

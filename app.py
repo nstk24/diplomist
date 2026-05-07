@@ -201,6 +201,62 @@ def get_spectral_importance(dataset: ProcessedDataset):
     return compute_spectral_importance(dataset)
 
 
+def _overview_stage_options(dataset: ProcessedDataset) -> list[str]:
+    options = ["После SNV-нормализации"]
+    if dataset.X_snr is not None:
+        options.insert(0, "После ALS baseline correction")
+    if dataset.X_smoothed is not None:
+        options.insert(0, "После сглаживания Savitzky-Golay")
+    if dataset.X_raw is not None:
+        options.insert(0, "До предобработки")
+    return options
+
+
+def _dataset_matrix_for_stage(dataset: ProcessedDataset, stage_label: str) -> tuple[np.ndarray, str]:
+    if stage_label == "До предобработки" and dataset.X_raw is not None:
+        return dataset.X_raw, "Интенсивность (исходная)"
+    if stage_label == "После сглаживания Savitzky-Golay" and dataset.X_smoothed is not None:
+        return dataset.X_smoothed, "Интенсивность после сглаживания"
+    if stage_label == "После ALS baseline correction" and dataset.X_snr is not None:
+        return dataset.X_snr, "Интенсивность после baseline correction"
+    return dataset.X, "SNV-интенсивность"
+
+
+def _mean_sem_by_class(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    healthy = X[y == 0]
+    disease = X[y == 1]
+    healthy_mean = healthy.mean(axis=0)
+    disease_mean = disease.mean(axis=0)
+    sem_healthy = healthy.std(axis=0, ddof=1) / np.sqrt(max(healthy.shape[0], 1))
+    sem_disease = disease.std(axis=0, ddof=1) / np.sqrt(max(disease.shape[0], 1))
+    return healthy_mean, sem_healthy, disease_mean, sem_disease
+
+
+def _std_by_class(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    healthy = X[y == 0]
+    disease = X[y == 1]
+    return healthy.std(axis=0, ddof=1), disease.std(axis=0, ddof=1)
+
+
+def _patient_pipeline_match_lines(dataset: ProcessedDataset, external: ExternalSpectrum) -> list[str]:
+    lines = [
+        "Обучающий датасет: исходный спектр -> Savitzky-Golay -> ALS baseline correction -> SNV.",
+        "Загруженный спектр пациента: чтение CSV -> сортировка/удаление дублей -> интерполяция на эталонную ось -> Savitzky-Golay -> ALS baseline correction -> SNV.",
+    ]
+    if dataset.X_smoothed is not None and dataset.X_snr is not None:
+        lines.append(
+            "Стадии сглаживания, baseline correction и SNV совпадают с обучающим датасетом."
+        )
+    lines.append(
+        "Дополнительная интерполяция у пациента нужна только для приведения внешнего CSV к той же оси волновых чисел, что и у обучающих данных."
+    )
+    if external.parser_mode == "two-column":
+        lines.append(
+            "Если в CSV пациента ось `wavenumber` уже совпадает с проектной, интерполяция почти не меняет сигнал и пайплайн практически эквивалентен обучающему."
+        )
+    return lines
+
+
 def _priority_to_russian(priority: str) -> str:
     return {
         "high": "высокий",
@@ -612,35 +668,44 @@ with tab_overview:
             use_container_width=True,
         )
 
-    healthy = dataset.X[dataset.y == 0]
-    disease = dataset.X[dataset.y == 1]
-    sem_healthy = healthy.std(axis=0, ddof=1) / np.sqrt(healthy.shape[0])
-    sem_disease = disease.std(axis=0, ddof=1) / np.sqrt(disease.shape[0])
+    overview_stage = st.radio(
+        "Отображение спектров на стадии preprocessing",
+        options=_overview_stage_options(dataset),
+        horizontal=True,
+    )
+    overview_X, overview_y_axis = _dataset_matrix_for_stage(dataset, overview_stage)
+    healthy_mean, sem_healthy, disease_mean, sem_disease = _mean_sem_by_class(overview_X, dataset.y)
+    healthy_std, disease_std = _std_by_class(overview_X, dataset.y)
 
     fig_mean = spectrum_with_band_figure(
         dataset.wavenumber,
-        analysis_summary["healthy_mean"],
+        healthy_mean,
         sem_healthy,
-        analysis_summary["disease_mean"],
+        disease_mean,
         sem_disease,
         "Healthy mean +/- SEM",
         "Disease mean +/- SEM",
-        "Mean spectra by class",
+        f"Средние спектры по классам: {overview_stage}",
+        overview_y_axis,
     )
     st.plotly_chart(fig_mean, use_container_width=True)
 
     fig_var = spectrum_line_figure(
         dataset.wavenumber,
-        [analysis_summary["healthy_std"], analysis_summary["disease_std"]],
+        [healthy_std, disease_std],
         ["Healthy std", "Disease std"],
-        "Spectral variability by class",
-        "Std",
+        f"Спектральная вариабельность: {overview_stage}",
+        "Std" if overview_stage == "После SNV-нормализации" else overview_y_axis,
     )
     st.plotly_chart(fig_var, use_container_width=True)
 
     st.write(
-        "Слой предобработки использует ALS baseline correction, после чего применяется SNV-нормализация. "
+        "Слой предобработки использует сглаживание Savitzky-Golay, затем ALS baseline correction, после чего применяется SNV-нормализация. "
         "Вся дальнейшая аналитика в приложении работает с нормализованным рабочим датасетом."
+    )
+    st.caption(
+        f"Сейчас на графиках показана стадия: `{overview_stage}`. "
+        f"Ось интенсивности соответствует представлению `{overview_y_axis}`."
     )
     if modeling_region_mode == "Авто":
         st.info(
@@ -749,10 +814,10 @@ with tab_models:
     with st.spinner("Running model comparison and nested CV..."):
         modeling_report = get_modeling_report(model_dataset)
 
-    st.subheader("Exploratory screening")
-    st.dataframe(modeling_report.screening_df, use_container_width=True)
+    st.subheader("Финально выбранная модель")
+    st.success(f"Для прогноза и основной оценки используется: `{modeling_report.final_selected_model_name}`")
 
-    st.subheader("Метрики лидера screening")
+    st.subheader("Метрики финально выбранной модели")
     left, right = st.columns([1, 2])
     screening_metrics_display = modeling_report.best_model_metrics_df.copy()
     screening_metrics_display = screening_metrics_display.rename(
@@ -768,9 +833,18 @@ with tab_models:
         use_container_width=True,
     )
     st.caption(
-        f"Слева показаны cross-validation метрики лучшего кандидата этапа screening: `{modeling_report.screening_df.iloc[0]['model']}`. "
-        "Они полезны для сравнения пайплайнов, но обычно выглядят оптимистичнее, чем nested CV для всей процедуры выбора модели."
+        f"Слева показаны cross-validation метрики того же пайплайна, который используется для прогноза: `{modeling_report.final_selected_model_name}`. "
+        "График справа нужен для обзора кандидатов, но не переопределяет финальную прогнозную модель."
     )
+    with st.expander("Показать подробные таблицы сравнения моделей", expanded=False):
+        st.markdown("**Screening: метрики всех пайплайнов**")
+        st.dataframe(modeling_report.screening_df, use_container_width=True)
+        st.markdown("**Inner CV: средний ROC-AUC по всем outer folds**")
+        st.dataframe(modeling_report.final_model_ranking_df, use_container_width=True)
+        st.markdown("**Inner CV по фолдам: каждая модель в каждом outer fold**")
+        st.dataframe(modeling_report.inner_score_df, use_container_width=True)
+        st.markdown("**Outer folds: какая модель была выбрана и какие метрики получились**")
+        st.dataframe(modeling_report.nested_fold_df, use_container_width=True)
 
     st.subheader("Nested CV для всей процедуры выбора модели")
     nested_metrics_display = modeling_report.nested_summary_df.rename(
@@ -790,7 +864,11 @@ with tab_models:
         modeling_report.selected_model_counts.rename_axis("pipeline").reset_index(name="count"),
         use_container_width=True,
     )
-    st.success(f"Most frequently selected pipeline: {modeling_report.final_selected_model_name}")
+    top_frequency_pipeline = str(modeling_report.selected_model_counts.index[0])
+    st.caption(
+        f"Наиболее частый выбор по outer folds: `{top_frequency_pipeline}`. "
+        "Для финального прогноза используется модель с лучшим средним inner-CV ROC-AUC на текущем датасете и диапазоне."
+    )
 
     if holdout_dataset is not None:
         st.subheader("Holdout evaluation on 10 excluded patients")
@@ -871,6 +949,9 @@ with tab_patient_prediction:
             )
 
             st.caption(f"Режим чтения CSV: {external.parser_mode}")
+            with st.expander("Сопоставление preprocessing-пайплайна пациента и обучающего датасета", expanded=False):
+                for line in _patient_pipeline_match_lines(dataset, external):
+                    st.write(f"- {line}")
             qc_cols = st.columns(3)
             qc_cols[0].metric("Корреляция со средним Healthy", f"{quality['corr_healthy']:.3f}")
             qc_cols[1].metric("Корреляция со средним Disease", f"{quality['corr_disease']:.3f}")
@@ -886,6 +967,7 @@ with tab_patient_prediction:
             st.write(str(quality["reason"]))
             prediction = predict_patient(modeling_report, external_model_vector)
             st.subheader("Результат прогноза")
+            st.info(f"Прогнозная модель: `{modeling_report.final_selected_model_name}`")
             pred_cols = st.columns(4)
             prediction_label_ru = _prediction_label_to_russian(str(prediction["predicted_label"]))
             pred_cols[0].metric("Режим интерпретации пиков", get_spectroscopy_mode_label(spectroscopy_mode))
